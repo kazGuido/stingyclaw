@@ -183,7 +183,7 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['OPENROUTER_API_KEY', 'MODEL_NAME', 'OPENROUTER_BASE_URL']);
+  return readEnvFile(['OPENROUTER_API_KEY', 'MODEL_NAME', 'OPENROUTER_BASE_URL', 'GEMINI_API_KEY']);
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {

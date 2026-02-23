@@ -120,7 +120,13 @@ For long-running work, use send_message to send intermediate updates.
 Your final text response (after all tool calls) is sent to the user automatically.
 
 Working directory: /workspace/group — read/write files here freely.
-Extra directories may be mounted at /workspace/extra/*/`,
+Extra directories may be mounted at /workspace/extra/*/
+
+You also have access to the Gemini CLI for complex coding tasks:
+- Run it via the Bash tool: \`gemini -p "your task" file.py\`
+- Use it when asked to write, refactor, or debug code across multiple files
+- It runs Gemini 2.5 Pro — use it for heavy lifting, not simple questions
+- Non-interactive mode only: always pass \`-p\` with a prompt, never run it interactively`,
   ];
 
   const groupMd = '/workspace/group/CLAUDE.md';
@@ -642,6 +648,10 @@ async function main(): Promise<void> {
   const apiKey = secrets.OPENROUTER_API_KEY ?? 'no-key';
   const modelName = secrets.MODEL_NAME ?? DEFAULT_MODEL;
   const baseURL = secrets.OPENROUTER_BASE_URL ?? DEFAULT_BASE_URL;
+  if (secrets.GEMINI_API_KEY) {
+    process.env.GEMINI_API_KEY = secrets.GEMINI_API_KEY;
+    process.env.GOOGLE_API_KEY = secrets.GEMINI_API_KEY;
+  }
   delete input.secrets;
 
   log(`Model: ${modelName} @ ${baseURL}`);
