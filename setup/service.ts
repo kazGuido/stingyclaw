@@ -106,6 +106,16 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): v
   fs.writeFileSync(plistPath, plist);
   logger.info({ plistPath }, 'Wrote launchd plist');
 
+  // Start voice service
+  try {
+    execSync(`docker compose -f ${JSON.stringify(projectRoot + '/docker-compose.yml')} up -d voice`, {
+      stdio: 'ignore',
+    });
+    logger.info('Voice service started');
+  } catch {
+    logger.warn('Could not start voice service (docker compose failed — start it manually with: docker compose up -d voice)');
+  }
+
   try {
     execSync(`launchctl load ${JSON.stringify(plistPath)}`, { stdio: 'ignore' });
     logger.info('launchctl load succeeded');
@@ -212,12 +222,31 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
     systemctlPrefix = 'systemctl --user';
   }
 
+  // Detect docker compose command (v2: `docker compose`, v1: `docker-compose`)
+  let dockerCompose = 'docker compose';
+  try {
+    execSync('docker compose version', { stdio: 'pipe' });
+  } catch {
+    try {
+      execSync('docker-compose version', { stdio: 'pipe' });
+      dockerCompose = 'docker-compose';
+    } catch {
+      dockerCompose = '';
+    }
+  }
+
+  const voiceExecStartPre = dockerCompose
+    ? `ExecStartPre=${dockerCompose} -f ${projectRoot}/docker-compose.yml up -d voice`
+    : '# Voice service: run "docker compose up -d voice" manually (docker compose not found)';
+
   const unit = `[Unit]
 Description=NanoClaw Personal Assistant
-After=network.target
+After=network.target docker.service
+Wants=docker.service
 
 [Service]
 Type=simple
+${voiceExecStartPre}
 ExecStart=${nodePath} ${projectRoot}/dist/index.js
 WorkingDirectory=${projectRoot}
 Restart=always
@@ -322,6 +351,16 @@ function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: stri
 
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   logger.info({ wrapperPath }, 'Wrote nohup wrapper script');
+
+  // Start voice service
+  try {
+    execSync(`docker compose -f ${JSON.stringify(projectRoot + '/docker-compose.yml')} up -d voice`, {
+      stdio: 'ignore',
+    });
+    logger.info('Voice service started');
+  } catch {
+    logger.warn('Could not start voice service — start it manually with: docker compose up -d voice');
+  }
 
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: 'nohup',

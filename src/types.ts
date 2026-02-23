@@ -82,6 +82,8 @@ export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  // Optional: send a voice note (OGG Opus buffer as WhatsApp PTT).
+  sendVoice?(jid: string, audioBuffer: Buffer): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

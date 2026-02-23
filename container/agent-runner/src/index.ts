@@ -122,11 +122,19 @@ Your final text response (after all tool calls) is sent to the user automaticall
 Working directory: /workspace/group — read/write files here freely.
 Extra directories may be mounted at /workspace/extra/*/
 
-You also have access to the Gemini CLI for complex coding tasks:
-- Run it via the Bash tool: \`gemini -p "your task" file.py\`
-- Use it when asked to write, refactor, or debug code across multiple files
+You also have access to the Gemini CLI:
+- Run it via the Bash tool: \`gemini -p "your prompt"\`
+- For coding tasks: refactor, debug, write code across multiple files
+- For research: \`gemini -p "search and summarize: topic"\` — it has Google Search built in
+- For best results on web questions: use Gemini to search AND WebFetch to read the actual page, then synthesize both into a single answer. Example: gemini finds the URL, WebFetch reads the full content, you combine them.
 - It runs Gemini 2.5 Pro — use it for heavy lifting, not simple questions
-- Non-interactive mode only: always pass \`-p\` with a prompt, never run it interactively`,
+- Non-interactive mode only: always pass \`-p\` with a prompt, never run it interactively
+
+Voice rules — follow these strictly:
+- When the user's message starts with [Voice: ...], you MUST call send_voice as your response. Do not reply with plain text alone.
+- Keep voice replies short — under ~150 words (about 30 seconds of speech).
+- After send_voice you may optionally add a short text follow-up for links, code, or anything that doesn't work well spoken.
+- For non-voice messages, use send_voice only when it genuinely adds value (e.g. the user explicitly asks for spoken output).`,
   ];
 
   const groupMd = '/workspace/group/CLAUDE.md';
@@ -307,11 +315,26 @@ const TOOLS: OpenAI.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'send_message',
-      description: 'Send a WhatsApp message to the chat right now (before finishing). Use for progress updates.',
+      description: 'Send a WhatsApp text message to the chat right now (before finishing). Use for progress updates.',
       parameters: {
         type: 'object',
         properties: {
           text: { type: 'string', description: 'Message text to send' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_voice',
+      description: 'Send a WhatsApp voice note (spoken audio). Use for natural conversational replies, especially when the user sent a voice message. Keep text short — under ~200 words.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Text to speak aloud as a voice note' },
+          voice: { type: 'string', description: 'Optional piper voice name (default: en_US-amy-medium). Available: en_US-amy-medium, en_US-ryan-high' },
         },
         required: ['text'],
       },
@@ -497,6 +520,18 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         return 'Message sent.';
+      }
+
+      case 'send_voice': {
+        writeIpcFile(IPC_MESSAGES_DIR, {
+          type: 'voice_message',
+          chatJid: input.chatJid,
+          text: args.text as string,
+          voice: args.voice as string | undefined,
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Voice message queued for sending.';
       }
 
       case 'schedule_task': {

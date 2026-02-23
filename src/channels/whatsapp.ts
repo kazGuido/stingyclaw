@@ -17,6 +17,7 @@ import {
   updateChatName,
 } from '../db.js';
 import { logger } from '../logger.js';
+import { isVoiceMessage, transcribeVoiceMessage } from '../transcription.js';
 import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -166,6 +167,33 @@ export class WhatsAppChannel implements Channel {
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
+          // Handle voice notes: download + transcribe, deliver as [Voice: text]
+          if (isVoiceMessage(msg)) {
+            const transcript = await transcribeVoiceMessage(msg, this.sock);
+            const content = transcript
+              ? `[Voice: ${transcript}]`
+              : '[Voice message — transcription unavailable]';
+
+            const sender = msg.key.participant || msg.key.remoteJid || '';
+            const senderName = msg.pushName || sender.split('@')[0];
+            const fromMe = msg.key.fromMe || false;
+            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
+              ? fromMe
+              : content.startsWith(`${ASSISTANT_NAME}:`);
+
+            this.opts.onMessage(chatJid, {
+              id: msg.key.id || '',
+              chat_jid: chatJid,
+              sender,
+              sender_name: senderName,
+              content,
+              timestamp,
+              is_from_me: fromMe,
+              is_bot_message: isBotMessage,
+            });
+            continue;
+          }
+
           const content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
@@ -201,6 +229,23 @@ export class WhatsAppChannel implements Channel {
         }
       }
     });
+  }
+
+  async sendVoice(jid: string, audioBuffer: Buffer): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid }, 'WA disconnected, dropping voice message');
+      return;
+    }
+    try {
+      await this.sock.sendMessage(jid, {
+        audio: audioBuffer,
+        ptt: true,
+        mimetype: 'audio/ogg; codecs=opus',
+      });
+      logger.info({ jid, bytes: audioBuffer.length }, 'Voice message sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send voice message');
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
