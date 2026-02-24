@@ -270,6 +270,17 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     );
   }
 
+  // Enable user lingering so the service survives SSH logout / reboot
+  // Without this, the user systemd session dies on logout and takes nanoclaw with it.
+  if (!runningAsRoot) {
+    try {
+      execSync('loginctl enable-linger', { stdio: 'ignore' });
+      logger.info('User lingering enabled (service will survive logout)');
+    } catch {
+      logger.warn('Could not enable loginctl linger — run "sudo loginctl enable-linger $USER" manually');
+    }
+  }
+
   // Kill orphaned nanoclaw processes to avoid WhatsApp conflict errors
   killOrphanedProcesses(projectRoot);
 
