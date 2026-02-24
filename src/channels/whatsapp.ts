@@ -28,6 +28,15 @@ export interface WhatsAppChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+// Backoff delays in ms: 2s, 5s, 15s, 30s, 60s, 60s, ...
+const RECONNECT_DELAYS = [2_000, 5_000, 15_000, 30_000, 60_000];
+
+function reconnectDelay(attempt: number): number {
+  const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
+  // Add ±10% jitter so multiple instances don't all retry in sync
+  return delay + Math.floor((Math.random() * 0.2 - 0.1) * delay);
+}
+
 export class WhatsAppChannel implements Channel {
   name = 'whatsapp';
 
@@ -37,6 +46,7 @@ export class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  private reconnectAttempts = 0;
 
   private opts: WhatsAppChannelOpts;
 
@@ -83,24 +93,24 @@ export class WhatsAppChannel implements Channel {
         this.connected = false;
         const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+        logger.info({ reason, shouldReconnect, attempt: this.reconnectAttempts, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
 
         if (shouldReconnect) {
-          logger.info('Reconnecting...');
-          this.connectInternal().catch((err) => {
-            logger.error({ err }, 'Failed to reconnect, retrying in 5s');
-            setTimeout(() => {
-              this.connectInternal().catch((err2) => {
-                logger.error({ err: err2 }, 'Reconnection retry failed');
-              });
-            }, 5000);
-          });
+          const delay = reconnectDelay(this.reconnectAttempts);
+          this.reconnectAttempts++;
+          logger.info({ delayMs: delay, attempt: this.reconnectAttempts }, 'Reconnecting with backoff...');
+          setTimeout(() => {
+            this.connectInternal().catch((err) => {
+              logger.error({ err }, 'Reconnect attempt failed, will retry via next close event');
+            });
+          }, delay);
         } else {
           logger.info('Logged out. Run /setup to re-authenticate.');
           process.exit(0);
         }
       } else if (connection === 'open') {
         this.connected = true;
+        this.reconnectAttempts = 0; // reset backoff on successful connect
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
