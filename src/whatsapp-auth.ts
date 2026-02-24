@@ -113,7 +113,11 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
         connectSocket(phoneNumber, true);
       } else {
         fs.writeFileSync(STATUS_FILE, `failed:${reason || 'unknown'}`);
-        console.log('\n✗ Connection failed. Please try again.');
+        console.log(`\n✗ Connection failed (reason: ${reason ?? 'unknown'}). Please try again.`);
+        if (reason === 405 || reason === 408) {
+          console.log('  WhatsApp is rate-limiting this IP. Wait 2-3 hours before retrying.');
+          console.log('  Do NOT retry immediately — each attempt resets the cooldown.');
+        }
         process.exit(1);
       }
     }
