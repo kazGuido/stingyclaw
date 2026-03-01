@@ -829,23 +829,39 @@ async function runQuery(
 
     log(`Model call #${i + 1} (${session.messages.length} messages in history)`);
 
-    // Gemini's OpenAI-compatible endpoint rejects content:"" on assistant messages
-    // that have tool_calls. Strip empty string content before sending.
+    // Gemini's OpenAI-compatible endpoint is strict about message shape:
+    // - Rejects content:"" on assistant messages that have tool_calls
+    // - Rejects null values for unknown fields like refusal, reasoning, reasoning_details
     const sanitizedMessages = session.messages.map((m: any) => {
-      if (m.role === 'assistant' && m.tool_calls?.length && m.content === '') {
-        const { content, ...rest } = m;
-        return rest;
-      }
-      return m;
+      if (m.role !== 'assistant') return m;
+      const cleaned: any = { role: m.role };
+      // Only include content if it's a non-empty string
+      if (typeof m.content === 'string' && m.content !== '') cleaned.content = m.content;
+      if (m.tool_calls?.length) cleaned.tool_calls = m.tool_calls;
+      return cleaned;
     });
 
-    const response = await client.chat.completions.create({
-      model: modelName,
-      messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
-      tools: TOOLS,
-      tool_choice: 'auto',
-      max_tokens: 8192,
-    });
+    let response;
+    try {
+      response = await client.chat.completions.create({
+        model: modelName,
+        messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
+        tools: TOOLS,
+        tool_choice: 'auto',
+        max_tokens: 8192,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? '';
+      // Gemini rejects sessions with turn-ordering violations or token overflow.
+      // Trim to the last 10 messages and retry once before giving up.
+      if (msg.includes('400') && session.messages.length > 10) {
+        log(`API 400 with ${session.messages.length} messages — trimming session to last 10 and retrying`);
+        session.messages = session.messages.slice(-10);
+        saveSession(session);
+        continue;
+      }
+      throw err;
+    }
 
     const choice = response.choices[0];
     const msg = choice.message;
