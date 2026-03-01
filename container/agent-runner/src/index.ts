@@ -917,7 +917,11 @@ async function main(): Promise<void> {
     // Gemini API direct — takes priority when set (one AI, free)
     apiKey = geminiKey;
     baseURL = GEMINI_BASE_URL;
-    modelName = secrets.MODEL_NAME ?? GEMINI_DEFAULT_MODEL;
+    // If MODEL_NAME looks like an OpenRouter slug (contains "/" or ends with ":free")
+    // it won't work against the Gemini endpoint — fall back to the Gemini default.
+    const rawModel = secrets.MODEL_NAME;
+    const looksLikeOpenRouter = rawModel && (rawModel.includes('/') || rawModel.includes(':'));
+    modelName = looksLikeOpenRouter ? GEMINI_DEFAULT_MODEL : (rawModel ?? GEMINI_DEFAULT_MODEL);
     backend = 'gemini';
   } else if (openrouterKey && openrouterKey !== 'no-key') {
     apiKey = openrouterKey;
