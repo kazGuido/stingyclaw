@@ -1,26 +1,27 @@
-# Voice service: Whisper (ASR) + Qwen3-TTS (TTS)
-# Qwen3-TTS replaces Piper for more natural-sounding speech
+# Voice service: LFM2.5-Audio-1.5B (GGUF, CPU)
+# One model handles both ASR (transcription) and TTS (synthesis).
+# GGUF backbone via llama-cpp-python; audio codec via PyTorch (CPU only).
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    wget \
+    ffmpeg cmake build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# CPU-only PyTorch + torchaudio from the same index (must match to avoid .so incompatibility)
+# CPU-only PyTorch + torchaudio from same index (must match to avoid .so mismatch)
 ARG TORCH_INDEX="https://download.pytorch.org/whl/cpu"
-RUN pip install --no-cache-dir torch torchaudio --index-url "${TORCH_INDEX}" || \
-    pip install --no-cache-dir torch torchaudio
+RUN pip install --no-cache-dir torch torchaudio --index-url "${TORCH_INDEX}"
+
+# llama-cpp-python — CPU build — for GGUF backbone inference
+RUN pip install --no-cache-dir llama-cpp-python
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt requests
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Whisper and Qwen3-TTS download on first request; volume persists them
 COPY server.py ./
-RUN chmod +x server.py 2>/dev/null || true
 
+# Model weights downloaded on first request; persist them via volume
 VOLUME ["/models"]
 
 EXPOSE 8001

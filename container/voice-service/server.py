@@ -1,12 +1,15 @@
 """
-Voice service for Stingyclaw.
+Voice service for Stingyclaw — powered by LFM2.5-Audio-1.5B (GGUF, CPU).
 
-ASR:  POST /transcribe  — accepts OGG/WebM/WAV audio, returns {"text": "..."}
-TTS:  POST /synthesize  — accepts {"text": "..."}, returns OGG Opus audio
-      Uses Qwen3-TTS (LLM-based) for natural-sounding speech.
-      Query param ?voice=Ryan or speaker name (Ryan, Aiden, Vivian, Serena, etc.)
-GET   /health           — liveness check
-GET   /voices           — list available speakers
+One model handles both:
+  ASR:  POST /transcribe  — audio bytes → {"text": "..."}
+  TTS:  POST /synthesize  — {"text": "..."} → OGG audio bytes
+  GET   /health           — liveness check
+
+Model: LiquidAI/LFM2.5-Audio-1.5B
+  - GGUF backbone (llama-cpp-python) for CPU-efficient LM inference
+  - FastConformer audio encoder + Mimi detokenizer for audio I/O
+  - Single model, no separate Whisper or TTS component needed
 """
 
 import io
@@ -17,183 +20,174 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+import soundfile as sf
+import torch
+import torchaudio
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
-from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
+HF_REPO = os.environ.get("LFM_REPO", "LiquidAI/LFM2.5-Audio-1.5B")
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/models"))
-TTS_MODEL = os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
-DEFAULT_SPEAKER = os.environ.get("DEFAULT_SPEAKER", "Ryan")
+# Use GGUF quantized model for CPU — Q4_K_M is a good balance of size/quality
+# Override with LFM_GGUF_FILE env var if you want a different quant
+GGUF_FILE = os.environ.get("LFM_GGUF_FILE", None)  # None = auto-detect
 
-# Qwen3-TTS CustomVoice speakers (English-friendly: Ryan, Aiden)
-SPEAKERS = ["Ryan", "Aiden", "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee"]
+# ── App ────────────────────────────────────────────────────────────────────────
 
-# ── App ────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Stingyclaw Voice Service (LFM2.5-Audio)")
 
-app = FastAPI(title="Stingyclaw Voice Service")
-
-# Lazy-loaded models (thread-safe init)
-_whisper: Optional[WhisperModel] = None
-_whisper_lock = threading.Lock()
-_tts_model = None
-_tts_lock = threading.Lock()
+_model = None
+_processor = None
+_model_lock = threading.Lock()
 
 
-def get_whisper() -> WhisperModel:
-    global _whisper
-    if _whisper is None:
-        with _whisper_lock:
-            if _whisper is None:
-                print(f"[voice] Loading whisper-{WHISPER_MODEL_SIZE}...", flush=True)
-                _whisper = WhisperModel(
-                    WHISPER_MODEL_SIZE,
-                    device="cpu",
-                    compute_type="int8",
-                    download_root=str(MODELS_DIR / "whisper"),
-                )
-                print("[voice] Whisper ready.", flush=True)
-    return _whisper
+def get_model():
+    global _model, _processor
+    if _model is None:
+        with _model_lock:
+            if _model is None:
+                from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
 
+                print(f"[voice] Loading LFM2.5-Audio from {HF_REPO}...", flush=True)
+                cache_dir = str(MODELS_DIR / "lfm2-audio")
 
-def get_tts():
-    """Lazy-load Qwen3-TTS model. Uses CPU by default; set CUDA_VISIBLE_DEVICES for GPU."""
-    global _tts_model
-    if _tts_model is None:
-        with _tts_lock:
-            if _tts_model is None:
-                import torch
-                from qwen_tts import Qwen3TTSModel
+                _processor = LFM2AudioProcessor.from_pretrained(
+                    HF_REPO,
+                    cache_dir=cache_dir,
+                ).eval()
 
-                print(f"[voice] Loading Qwen3-TTS ({TTS_MODEL})...", flush=True)
-                device = "cuda:0" if torch.cuda.is_available() else "cpu"
-                dtype = torch.bfloat16 if device != "cpu" else torch.float32
-                load_kwargs = {
-                    "device_map": device,
-                    "torch_dtype": dtype,
-                    "cache_dir": str(MODELS_DIR / "qwen-tts"),
+                load_kwargs: dict = {
+                    "cache_dir": cache_dir,
                 }
-                if device != "cpu":
-                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                # Load GGUF if specified or auto-detected
+                if GGUF_FILE:
+                    load_kwargs["gguf_file"] = GGUF_FILE
+                    print(f"[voice] Using GGUF: {GGUF_FILE}", flush=True)
 
-                _tts_model = Qwen3TTSModel.from_pretrained(TTS_MODEL, **load_kwargs)
-                print(f"[voice] Qwen3-TTS ready on {device}.", flush=True)
-    return _tts_model
+                _model = LFM2AudioModel.from_pretrained(
+                    HF_REPO,
+                    **load_kwargs,
+                ).eval()
+
+                print("[voice] LFM2.5-Audio ready.", flush=True)
+    return _model, _processor
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Audio helpers ──────────────────────────────────────────────────────────────
+
+
+def bytes_to_tensor(audio_bytes: bytes, filename: str = "audio.ogg") -> tuple[torch.Tensor, int]:
+    """Convert raw audio bytes to (waveform_tensor, sample_rate)."""
+    suffix = Path(filename).suffix or ".ogg"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(audio_bytes)
+        tmp_path = f.name
+    try:
+        wav, sr = torchaudio.load(tmp_path)
+        return wav, sr
+    finally:
+        os.unlink(tmp_path)
+
+
+def tensor_to_ogg(waveform: torch.Tensor, sample_rate: int = 24000) -> bytes:
+    """Convert waveform tensor to OGG Opus bytes."""
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+        tmp_path = f.name
+    try:
+        torchaudio.save(tmp_path, waveform.cpu(), sample_rate, format="ogg")
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_path)
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "whisper_model": WHISPER_MODEL_SIZE,
-        "tts_model": TTS_MODEL,
-    }
-
-
-@app.get("/voices")
-def voices():
-    return {"speakers": SPEAKERS, "default": DEFAULT_SPEAKER}
-
-
-class SynthRequest(BaseModel):
-    text: str
-    voice: Optional[str] = None
+    return {"status": "ok", "model": HF_REPO}
 
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """Transcribe an audio file (OGG/Opus, WAV, MP3, etc.) to text."""
+    """Transcribe an audio file to text using LFM2.5-Audio ASR."""
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
-    suffix = Path(audio.filename or "audio.ogg").suffix or ".ogg"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(data)
-        tmp_path = f.name
+    model, processor = get_model()
 
     try:
-        model = get_whisper()
-        segments, info = model.transcribe(
-            tmp_path,
-            beam_size=5,
-            language=None,
-            vad_filter=True,
-        )
-        text = " ".join(s.text for s in segments).strip()
-        return {
-            "text": text,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 3),
-        }
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        from liquid_audio import ChatState, LFMModality
+
+        wav, sr = bytes_to_tensor(data, audio.filename or "audio.ogg")
+
+        chat = ChatState(processor)
+        chat.new_turn("system")
+        chat.add_text("Transcribe the following audio to text. Output only the transcript, nothing else.")
+        chat.end_turn()
+        chat.new_turn("user")
+        chat.add_audio(wav, sr)
+        chat.end_turn()
+        chat.new_turn("assistant")
+
+        text_tokens: list[torch.Tensor] = []
+        with torch.no_grad():
+            for t in model.generate_sequential(**chat, max_new_tokens=512):
+                if t.numel() == 1:  # text token
+                    text_tokens.append(t)
+
+        transcript = processor.text.decode(torch.stack(text_tokens, dim=1)) if text_tokens else ""
+        return {"text": transcript.strip()}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SynthRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None  # reserved for future voice selection
 
 
 @app.post("/synthesize")
-async def synthesize(
-    req: SynthRequest,
-    format: str = Query("ogg", pattern="^(ogg|wav)$"),
-):
-    """Convert text to speech via Qwen3-TTS. Returns OGG Opus (default) or WAV."""
-    speaker = (req.voice or DEFAULT_SPEAKER).strip()
-    if speaker not in SPEAKERS:
-        speaker = DEFAULT_SPEAKER
+async def synthesize(req: SynthRequest):
+    """Synthesize speech from text using LFM2.5-Audio TTS. Returns OGG audio."""
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty text")
 
-    model = get_tts()
-    wavs, sr = model.generate_custom_voice(
-        text=req.text,
-        language="Auto",
-        speaker=speaker,
-        instruct=None,
-    )
-
-    # wavs is list of numpy arrays, sr is sample rate (e.g. 24000)
-    import numpy as np
-    import soundfile as sf
-
-    wav = wavs[0] if isinstance(wavs[0], np.ndarray) else np.array(wavs[0])
-
-    if format == "wav":
-        buf = io.BytesIO()
-        sf.write(buf, wav, sr, format="WAV")
-        buf.seek(0)
-        return Response(content=buf.read(), media_type="audio/wav")
-
-    # Default: OGG Opus for WhatsApp PTT
-    # soundfile doesn't write OGG/Opus directly; use ffmpeg
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, wav, sr)
-        wav_path = f.name
+    model, processor = get_model()
 
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", wav_path,
-                "-c:a", "libopus", "-b:a", "32k",
-                "-f", "ogg", "pipe:1",
-            ],
-            capture_output=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"OGG conversion failed: {result.stderr.decode()[:200]}",
-            )
-        return Response(content=result.stdout, media_type="audio/ogg")
-    finally:
-        try:
-            os.unlink(wav_path)
-        except OSError:
-            pass
+        from liquid_audio import ChatState, LFMModality
+
+        chat = ChatState(processor)
+        chat.new_turn("system")
+        chat.add_text("Respond with audio only.")
+        chat.end_turn()
+        chat.new_turn("user")
+        chat.add_text(req.text)
+        chat.end_turn()
+        chat.new_turn("assistant")
+
+        audio_tokens: list[torch.Tensor] = []
+        with torch.no_grad():
+            for t in model.generate_sequential(**chat, max_new_tokens=2048):
+                if t.numel() > 1:  # audio token (multi-dim)
+                    audio_tokens.append(t)
+
+        if not audio_tokens:
+            raise HTTPException(status_code=500, detail="Model produced no audio output")
+
+        # Last token is end-of-audio sentinel — drop it
+        audio_codes = torch.stack(audio_tokens[:-1], dim=1).unsqueeze(0)
+        waveform = processor.decode(audio_codes)  # 24kHz mono
+
+        ogg_bytes = tensor_to_ogg(waveform, sample_rate=24000)
+        return Response(content=ogg_bytes, media_type="audio/ogg")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

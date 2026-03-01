@@ -2,12 +2,11 @@
  * Stingyclaw Agent Runner
  *
  * OpenAI-compatible agentic loop. Supports three backends:
- *   1. Gemini API (recommended, free) — set GEMINI_API_KEY
- *   2. OpenRouter (any model)         — set OPENROUTER_API_KEY
- *   3. Local Ollama                   — set OPENROUTER_API_KEY=ollama
+ *   1. OpenRouter (default)  — set OPENROUTER_API_KEY + MODEL_NAME
+ *   2. Local Ollama          — set OPENROUTER_API_KEY=ollama
+ *   3. Gemini API (fallback) — set GEMINI_API_KEY (only if no OPENROUTER_API_KEY)
  *
- * Priority: GEMINI_API_KEY > OPENROUTER_API_KEY
- * Override model with MODEL_NAME env var.
+ * Priority: OPENROUTER_API_KEY > GEMINI_API_KEY
  */
 
 import fs from 'fs';
@@ -939,21 +938,20 @@ async function main(): Promise<void> {
     baseURL = secrets.OPENROUTER_BASE_URL ?? 'http://host.docker.internal:11434/v1';
     modelName = secrets.MODEL_NAME ?? 'llama3.2';
     backend = 'ollama';
-  } else if (geminiKey) {
-    // Gemini API direct — takes priority when set (one AI, free)
-    apiKey = geminiKey;
-    baseURL = GEMINI_BASE_URL;
-    // If MODEL_NAME looks like an OpenRouter slug (contains "/" or ends with ":free")
-    // it won't work against the Gemini endpoint — fall back to the Gemini default.
-    const rawModel = secrets.MODEL_NAME;
-    const looksLikeOpenRouter = rawModel && (rawModel.includes('/') || rawModel.includes(':'));
-    modelName = looksLikeOpenRouter ? GEMINI_DEFAULT_MODEL : (rawModel ?? GEMINI_DEFAULT_MODEL);
-    backend = 'gemini';
   } else if (openrouterKey && openrouterKey !== 'no-key') {
+    // OpenRouter takes priority — this is the primary backend
     apiKey = openrouterKey;
     baseURL = secrets.OPENROUTER_BASE_URL ?? OPENROUTER_BASE_URL;
     modelName = secrets.MODEL_NAME ?? OPENROUTER_DEFAULT_MODEL;
     backend = 'openrouter';
+  } else if (geminiKey) {
+    // Gemini fallback — only used when no OPENROUTER_API_KEY is set
+    apiKey = geminiKey;
+    baseURL = GEMINI_BASE_URL;
+    const rawModel = secrets.MODEL_NAME;
+    const looksLikeOpenRouter = rawModel && (rawModel.includes('/') || rawModel.includes(':'));
+    modelName = looksLikeOpenRouter ? GEMINI_DEFAULT_MODEL : (rawModel ?? GEMINI_DEFAULT_MODEL);
+    backend = 'gemini';
   } else {
     apiKey = 'no-key';
     baseURL = OPENROUTER_BASE_URL;
