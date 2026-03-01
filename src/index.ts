@@ -31,7 +31,7 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, MAX_RETRIES } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -129,14 +129,14 @@ export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): v
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
+async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; error?: string }> {
   const group = registeredGroups[chatJid];
-  if (!group) return true;
+  if (!group) return { ok: true };
 
   const channel = findChannel(channels, chatJid);
   if (!channel) {
     console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-    return true;
+    return { ok: true };
   }
 
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
@@ -144,14 +144,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
 
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) return { ok: true };
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const hasTrigger = missedMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
-    if (!hasTrigger) return true;
+    if (!hasTrigger) return { ok: true };
   }
 
   const prompt = formatMessages(missedMessages);
@@ -227,21 +227,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
+  if (output.status === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
-      return true;
+      return { ok: true };
     }
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
     logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-    return false;
+    return { ok: false, error: output.error };
   }
 
-  return true;
+  return { ok: true };
 }
 
 async function runAgent(
@@ -249,7 +249,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
+): Promise<{ status: 'success' | 'error'; error?: string }> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
@@ -314,13 +314,14 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      return 'error';
+      return { status: 'error', error: output.error };
     }
 
-    return 'success';
+    return { status: 'success' };
   } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    return { status: 'error', error };
   }
 }
 
@@ -502,6 +503,15 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processGroupMessages);
+  queue.setOnMaxRetriesExceeded((groupJid, error) => {
+    const channel = findChannel(channels, groupJid);
+    if (!channel) return;
+    const errorText = error ? error.slice(0, 300) : 'unknown error';
+    const msg = `⚠️ Agent failed after ${MAX_RETRIES} retries and gave up.\n\nLast error:\n\`${errorText}\`\n\nSend another message to retry.`;
+    channel.sendMessage(groupJid, msg).catch((err) =>
+      logger.error({ groupJid, err }, 'Failed to send error notification'),
+    );
+  });
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');

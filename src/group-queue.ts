@@ -11,7 +11,7 @@ interface QueuedTask {
   fn: () => Promise<void>;
 }
 
-const MAX_RETRIES = 5;
+export const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
 interface GroupState {
@@ -24,14 +24,15 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  lastError: string | undefined;
 }
 
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
   private waitingGroups: string[] = [];
-  private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
-    null;
+  private processMessagesFn: ((groupJid: string) => Promise<{ ok: boolean; error?: string }>) | null = null;
+  private onMaxRetriesExceededFn: ((groupJid: string, error?: string) => void) | null = null;
   private shuttingDown = false;
 
   private getGroup(groupJid: string): GroupState {
@@ -47,14 +48,19 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        lastError: undefined,
       };
       this.groups.set(groupJid, state);
     }
     return state;
   }
 
-  setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
+  setProcessMessagesFn(fn: (groupJid: string) => Promise<{ ok: boolean; error?: string }>): void {
     this.processMessagesFn = fn;
+  }
+
+  setOnMaxRetriesExceeded(fn: (groupJid: string, error?: string) => void): void {
+    this.onMaxRetriesExceededFn = fn;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -199,14 +205,17 @@ export class GroupQueue {
 
     try {
       if (this.processMessagesFn) {
-        const success = await this.processMessagesFn(groupJid);
-        if (success) {
+        const result = await this.processMessagesFn(groupJid);
+        if (result.ok) {
           state.retryCount = 0;
+          state.lastError = undefined;
         } else {
+          state.lastError = result.error;
           this.scheduleRetry(groupJid, state);
         }
       }
     } catch (err) {
+      state.lastError = err instanceof Error ? err.message : String(err);
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
@@ -253,7 +262,9 @@ export class GroupQueue {
         { groupJid, retryCount: state.retryCount },
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
       );
+      this.onMaxRetriesExceededFn?.(groupJid, state.lastError);
       state.retryCount = 0;
+      state.lastError = undefined;
       return;
     }
 
