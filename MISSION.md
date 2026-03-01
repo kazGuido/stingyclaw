@@ -1,10 +1,10 @@
-# NanoClaw
+# Stingyclaw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+WhatsApp AI assistant powered by OpenRouter. See [README.md](README.md) for setup.
 
 ## Quick Context
 
-Single Node.js process that connects to WhatsApp, routes messages to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+Single Node.js process that connects to WhatsApp, routes messages to agents running in isolated Docker containers. Each group has its own filesystem, memory (`MISSION.md`), and session.
 
 ## Key Files
 
@@ -18,17 +18,8 @@ Single Node.js process that connects to WhatsApp, routes messages to Claude Agen
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
-
-## Skills
-
-| Skill | When to Use |
-|-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
-| `/customize` | Adding channels, integrations, changing behavior |
-| `/debug` | Container issues, logs, troubleshooting |
-| `/update` | Pull upstream NanoClaw changes, merge with customizations, run migrations |
+| `container/agent-runner/src/index.ts` | Agent loop (OpenAI-compatible, OpenRouter/Ollama) |
+| `groups/{name}/MISSION.md` | Per-group memory and persona |
 
 ## Development
 

@@ -19,7 +19,10 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
-import { WHATSAPP_VERSION } from './whatsapp-version.js';
+import {
+  fetchAndPersistVersion,
+  getWhatsAppVersion,
+} from './whatsapp-version.js';
 
 const AUTH_DIR = './store/auth';
 const QR_FILE = './store/qr-data.txt';
@@ -60,7 +63,7 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-    version: WHATSAPP_VERSION,
+    version: getWhatsAppVersion(),
     printQRInTerminal: false,
     logger,
     browser: Browsers.macOS('Chrome'),
@@ -85,7 +88,7 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
     }, 3000);
   }
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -116,10 +119,28 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
         connectSocket(phoneNumber, true);
       } else {
         fs.writeFileSync(STATUS_FILE, `failed:${reason || 'unknown'}`);
-        console.log(`\n✗ Connection failed (reason: ${reason ?? 'unknown'}). Please try again.`);
         if (reason === 405 || reason === 408) {
-          console.log('  WhatsApp is rate-limiting this IP. Wait 2-3 hours before retrying.');
-          console.log('  Do NOT retry immediately — each attempt resets the cooldown.');
+          const newVersion = await fetchAndPersistVersion();
+          if (newVersion) {
+            console.log(
+              `\n✗ Connection failed (405). Updated WhatsApp version to [2, 3000, ${newVersion[2]}].`,
+            );
+            console.log('  Run `npm run auth` again.');
+          } else {
+            console.log(
+              `\n✗ Connection failed (reason: ${reason}). Could not fetch new version.`,
+            );
+            console.log(
+              '  WhatsApp may be rate-limiting this IP. Wait 2-3 hours before retrying.',
+            );
+            console.log(
+              '  Or run `npm run update-wa-version` to refresh the version, then try again.',
+            );
+          }
+        } else {
+          console.log(
+            `\n✗ Connection failed (reason: ${reason ?? 'unknown'}). Please try again.`,
+          );
         }
         process.exit(1);
       }

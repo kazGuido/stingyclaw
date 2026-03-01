@@ -3,13 +3,13 @@ Voice service for Stingyclaw.
 
 ASR:  POST /transcribe  — accepts OGG/WebM/WAV audio, returns {"text": "..."}
 TTS:  POST /synthesize  — accepts {"text": "..."}, returns OGG Opus audio
-      Query param ?voice=en_US-amy-medium or any installed piper voice name.
+      Uses Qwen3-TTS (LLM-based) for natural-sounding speech.
+      Query param ?voice=Ryan or speaker name (Ryan, Aiden, Vivian, Serena, etc.)
 GET   /health           — liveness check
-GET   /voices           — list installed piper voices
+GET   /voices           — list available speakers
 """
 
 import io
-import json
 import os
 import subprocess
 import tempfile
@@ -26,17 +26,21 @@ from pydantic import BaseModel
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/models"))
-PIPER_DIR = MODELS_DIR / "piper"
-PIPER_BIN = "/usr/local/piper/piper"
-DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "en_US-amy-medium")
+TTS_MODEL = os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+DEFAULT_SPEAKER = os.environ.get("DEFAULT_SPEAKER", "Ryan")
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# Qwen3-TTS CustomVoice speakers (English-friendly: Ryan, Aiden)
+SPEAKERS = ["Ryan", "Aiden", "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee"]
+
+# ── App ────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Stingyclaw Voice Service")
 
-# Lazy-loaded Whisper model (thread-safe init)
+# Lazy-loaded models (thread-safe init)
 _whisper: Optional[WhisperModel] = None
 _whisper_lock = threading.Lock()
+_tts_model = None
+_tts_lock = threading.Lock()
 
 
 def get_whisper() -> WhisperModel:
@@ -55,15 +59,29 @@ def get_whisper() -> WhisperModel:
     return _whisper
 
 
-def list_piper_voices() -> list[str]:
-    """Return basenames of installed piper voices (without .onnx suffix)."""
-    if not PIPER_DIR.exists():
-        return []
-    return [p.stem for p in PIPER_DIR.glob("*.onnx")]
+def get_tts():
+    """Lazy-load Qwen3-TTS model. Uses CPU by default; set CUDA_VISIBLE_DEVICES for GPU."""
+    global _tts_model
+    if _tts_model is None:
+        with _tts_lock:
+            if _tts_model is None:
+                import torch
+                from qwen_tts import Qwen3TTSModel
 
+                print(f"[voice] Loading Qwen3-TTS ({TTS_MODEL})...", flush=True)
+                device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                dtype = torch.bfloat16 if device != "cpu" else torch.float32
+                load_kwargs = {
+                    "device_map": device,
+                    "torch_dtype": dtype,
+                    "cache_dir": str(MODELS_DIR / "qwen-tts"),
+                }
+                if device != "cpu":
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
 
-def piper_model_path(voice: str) -> Path:
-    return PIPER_DIR / f"{voice}.onnx"
+                _tts_model = Qwen3TTSModel.from_pretrained(TTS_MODEL, **load_kwargs)
+                print(f"[voice] Qwen3-TTS ready on {device}.", flush=True)
+    return _tts_model
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -71,12 +89,16 @@ def piper_model_path(voice: str) -> Path:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "whisper_model": WHISPER_MODEL_SIZE}
+    return {
+        "status": "ok",
+        "whisper_model": WHISPER_MODEL_SIZE,
+        "tts_model": TTS_MODEL,
+    }
 
 
 @app.get("/voices")
 def voices():
-    return {"voices": list_piper_voices(), "default": DEFAULT_VOICE}
+    return {"speakers": SPEAKERS, "default": DEFAULT_SPEAKER}
 
 
 class SynthRequest(BaseModel):
@@ -101,8 +123,8 @@ async def transcribe(audio: UploadFile = File(...)):
         segments, info = model.transcribe(
             tmp_path,
             beam_size=5,
-            language=None,  # auto-detect
-            vad_filter=True,  # skip silence
+            language=None,
+            vad_filter=True,
         )
         text = " ".join(s.text for s in segments).strip()
         return {
@@ -122,66 +144,56 @@ async def synthesize(
     req: SynthRequest,
     format: str = Query("ogg", pattern="^(ogg|wav)$"),
 ):
-    """Convert text to speech. Returns OGG Opus (default) or WAV audio."""
-    voice = req.voice or DEFAULT_VOICE
-    model_path = piper_model_path(voice)
+    """Convert text to speech via Qwen3-TTS. Returns OGG Opus (default) or WAV."""
+    speaker = (req.voice or DEFAULT_SPEAKER).strip()
+    if speaker not in SPEAKERS:
+        speaker = DEFAULT_SPEAKER
 
-    if not model_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Voice '{voice}' not found. Available: {list_piper_voices()}",
-        )
+    model = get_tts()
+    wavs, sr = model.generate_custom_voice(
+        text=req.text,
+        language="Auto",
+        speaker=speaker,
+        instruct=None,
+    )
 
-    if not Path(PIPER_BIN).exists():
-        raise HTTPException(status_code=503, detail="Piper binary not found")
+    # wavs is list of numpy arrays, sr is sample rate (e.g. 24000)
+    import numpy as np
+    import soundfile as sf
 
-    # Run piper: stdin → WAV bytes on stdout
-    try:
-        piper_result = subprocess.run(
-            [PIPER_BIN, "--model", str(model_path), "--output-raw"],
-            input=req.text.encode("utf-8"),
-            capture_output=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Piper TTS timed out")
-
-    if piper_result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Piper failed: {piper_result.stderr.decode()[:200]}",
-        )
-
-    raw_pcm = piper_result.stdout  # raw s16le PCM at 22050 Hz mono
+    wav = wavs[0] if isinstance(wavs[0], np.ndarray) else np.array(wavs[0])
 
     if format == "wav":
-        # Wrap raw PCM in a proper WAV container via ffmpeg
+        buf = io.BytesIO()
+        sf.write(buf, wav, sr, format="WAV")
+        buf.seek(0)
+        return Response(content=buf.read(), media_type="audio/wav")
+
+    # Default: OGG Opus for WhatsApp PTT
+    # soundfile doesn't write OGG/Opus directly; use ffmpeg
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        sf.write(f.name, wav, sr)
+        wav_path = f.name
+
+    try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0",
-                "-f", "wav", "pipe:1",
+                "-i", wav_path,
+                "-c:a", "libopus", "-b:a", "32k",
+                "-f", "ogg", "pipe:1",
             ],
-            input=raw_pcm,
             capture_output=True,
-            timeout=30,
+            timeout=60,
         )
         if result.returncode != 0:
-            raise HTTPException(status_code=500, detail="WAV conversion failed")
-        return Response(content=result.stdout, media_type="audio/wav")
-
-    # Default: OGG Opus — what WhatsApp PTT expects
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0",
-            "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
-        ],
-        input=raw_pcm,
-        capture_output=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise HTTPException(status_code=500, detail="OGG conversion failed")
-
-    return Response(content=result.stdout, media_type="audio/ogg")
+            raise HTTPException(
+                status_code=500,
+                detail=f"OGG conversion failed: {result.stderr.decode()[:200]}",
+            )
+        return Response(content=result.stdout, media_type="audio/ogg")
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass

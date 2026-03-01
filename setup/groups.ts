@@ -110,9 +110,16 @@ const upsert = db.prepare(
 
 const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+let version = [2, 3000, 1034270928];
+try {
+  const raw = fs.readFileSync(path.join('store', 'wa-version.json'), 'utf-8');
+  const parsed = JSON.parse(raw);
+  if (Array.isArray(parsed) && parsed.length === 3) version = parsed;
+} catch {}
+
 const sock = makeWASocket({
   auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-  version: [2, 3000, 1034270928],
+  version,
   printQRInTerminal: false,
   logger,
   browser: Browsers.macOS('Chrome'),

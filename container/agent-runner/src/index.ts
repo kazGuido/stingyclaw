@@ -1,19 +1,13 @@
 /**
- * NanoClaw Agent Runner — OpenRouter Edition
+ * Stingyclaw Agent Runner
  *
- * Replaces @anthropic-ai/claude-agent-sdk with a plain OpenAI-compatible
- * agentic loop so you can use any model on OpenRouter or a local Ollama instance.
+ * OpenAI-compatible agentic loop. Supports three backends:
+ *   1. Gemini API (recommended, free) — set GEMINI_API_KEY
+ *   2. OpenRouter (any model)         — set OPENROUTER_API_KEY
+ *   3. Local Ollama                   — set OPENROUTER_API_KEY=ollama
  *
- * Config (passed via .env → secrets in stdin JSON):
- *   OPENROUTER_API_KEY   API key for OpenRouter (use "ollama" for local Ollama)
- *   MODEL_NAME           Model identifier (default: liquid/lfm-2.5)
- *   OPENROUTER_BASE_URL  API base URL (default: https://openrouter.ai/api/v1)
- *                        For Ollama: http://host.docker.internal:11434/v1
- *
- * Free OpenRouter models worth trying:
- *   liquid/lfm-2.5          — fast, good tool use
- *   google/gemini-flash-1.5 — free tier available
- *   mistralai/mistral-7b-instruct:free
+ * Priority: GEMINI_API_KEY > OPENROUTER_API_KEY
+ * Override model with MODEL_NAME env var.
  */
 
 import fs from 'fs';
@@ -22,6 +16,10 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import OpenAI from 'openai';
+import { pipeline, env as xenovaEnv } from '@xenova/transformers';
+
+// Store model in the shared stingyclaw data dir so it persists across rebuilds
+xenovaEnv.cacheDir = '/home/node/.stingyclaw/transformers';
 
 const execAsync = promisify(exec);
 
@@ -37,10 +35,30 @@ const IPC_TASKS_DIR = `${IPC_DIR}/tasks`;
 const IPC_INPUT_CLOSE_SENTINEL = `${IPC_INPUT_DIR}/_close`;
 const IPC_POLL_MS = 500;
 
-const SESSIONS_DIR = '/home/node/.claude/sessions';
+const SESSIONS_DIR = '/home/node/.stingyclaw/sessions';
 const MAX_TOOL_ITERATIONS = 60;
-const DEFAULT_MODEL = 'liquid/lfm-2.5';
-const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+const GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash';
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+const OPENROUTER_DEFAULT_MODEL = 'liquid/lfm-2.5';
+
+type Backend = 'gemini' | 'openrouter' | 'ollama';
+
+// ─── Local embedder (lazy-loaded, shared across tool calls) ──────────────────
+
+const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _embedder: any = null;
+
+async function getEmbedder() {
+  if (!_embedder) {
+    log(`Loading embedding model ${EMBED_MODEL}...`);
+    _embedder = await pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
+    log('Embedding model ready');
+  }
+  return _embedder;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -122,28 +140,40 @@ Your final text response (after all tool calls) is sent to the user automaticall
 Working directory: /workspace/group — read/write files here freely.
 Extra directories may be mounted at /workspace/extra/*/
 
-You also have access to the Gemini CLI:
-- Run it via the Bash tool: \`gemini -p "your prompt"\`
-- For coding tasks: refactor, debug, write code across multiple files
-- For research: \`gemini -p "search and summarize: topic"\` — it has Google Search built in
-- For best results on web questions: use Gemini to search AND WebFetch to read the actual page, then synthesize both into a single answer. Example: gemini finds the URL, WebFetch reads the full content, you combine them.
-- It runs Gemini 2.5 Pro — use it for heavy lifting, not simple questions
-- Non-interactive mode only: always pass \`-p\` with a prompt, never run it interactively
+Web browsing — use agent-browser for any page that needs it:
+- \`agent-browser open <url>\` → navigate
+- \`agent-browser snapshot -i\` → get interactive elements (buttons, links, inputs) with refs like @e1, @e2
+- \`agent-browser click @e1\` / \`agent-browser fill @e2 "text"\` → interact via refs
+- \`agent-browser get text @e1\` / \`agent-browser screenshot page.png\` → extract content
+- \`agent-browser close\` when done
+- Use WebFetch for simple static pages (faster). Use agent-browser for JS-heavy pages, login flows, or when you need to interact.
 
 Voice rules — follow these strictly:
 - When the user's message starts with [Voice: ...], you MUST call send_voice as your response. Do not reply with plain text alone.
 - Keep voice replies short — under ~150 words (about 30 seconds of speech).
 - After send_voice you may optionally add a short text follow-up for links, code, or anything that doesn't work well spoken.
-- For non-voice messages, use send_voice only when it genuinely adds value (e.g. the user explicitly asks for spoken output).`,
+- For non-voice messages, use send_voice only when it genuinely adds value (e.g. the user explicitly asks for spoken output).
+
+Workflows — pre-built automations the user has defined:
+- When asked "what can you do?" or "what workflows exist?" → call list_workflows
+- When the user asks you to do something → call search_tools("intent") first to check if a workflow exists
+- If found → run it with run_workflow(name, args)
+- If not found → use your built-in tools (Bash, WebFetch, etc.) directly
+
+Tell the boss — when stuck or unsure:
+- If you're not sure what to do, about to do something risky/irreversible, or need human approval, use ask_boss to ask the user first.
+- Do NOT guess or proceed blindly. Your message will be sent; their reply will come in the next message. Stop and wait for it.`,
   ];
 
-  const groupMd = '/workspace/group/CLAUDE.md';
+  // (no secondary AI CLI — the primary model handles everything directly)
+
+  const groupMd = '/workspace/group/MISSION.md';
   if (fs.existsSync(groupMd)) {
     parts.push('\n\n---\n' + fs.readFileSync(groupMd, 'utf-8'));
   }
 
   if (!input.isMain) {
-    const globalMd = '/workspace/global/CLAUDE.md';
+    const globalMd = '/workspace/global/MISSION.md';
     if (fs.existsSync(globalMd)) {
       parts.push('\n\n---\n' + fs.readFileSync(globalMd, 'utf-8'));
     }
@@ -334,9 +364,23 @@ const TOOLS: OpenAI.ChatCompletionTool[] = [
         type: 'object',
         properties: {
           text: { type: 'string', description: 'Text to speak aloud as a voice note' },
-          voice: { type: 'string', description: 'Optional piper voice name (default: en_US-amy-medium). Available: en_US-amy-medium, en_US-ryan-high' },
+          voice: { type: 'string', description: 'Optional speaker: Ryan, Aiden, Vivian, Serena, Uncle_Fu, Dylan, Eric, Ono_Anna, Sohee (default: Ryan)' },
         },
         required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ask_boss',
+      description: 'Ask the user (the boss) for guidance when stuck, unsure, or before doing something risky/irreversible. Your question is sent to the chat. Stop and wait for their reply — do not proceed until you have it. Use when: ambiguous request, destructive action, sensitive data, or you lack context.',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'Clear question or context for the user to respond to' },
+        },
+        required: ['question'],
       },
     },
   },
@@ -401,7 +445,118 @@ const TOOLS: OpenAI.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'list_workflows',
+      description: 'List all available workflows and automations in the registry. Call this when the user asks what you can do, what automations are available, or to browse capabilities.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_tools',
+      description: 'Search the workflow registry for tools/automations by keyword or intent. Returns matching entries with name, description, and how to run them. Call this first when the user asks you to do something that might be a pre-built workflow.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Keywords describing what you want to do, e.g. "morning briefing", "send slack message", "fetch leads"' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_workflow',
+      description: 'Run a workflow by name from the registry. Optionally pass arguments as a JSON object.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Workflow name from the registry' },
+          args: { type: 'object', description: 'Optional key-value arguments passed as environment variables to the script', additionalProperties: { type: 'string' } },
+        },
+        required: ['name'],
+      },
+    },
+  },
 ];
+
+// ─── Semantic search helpers ──────────────────────────────────────────────────
+
+interface RegistryEntry {
+  name: string;
+  description: string;
+  run: string;
+  args?: string[];
+}
+
+interface EmbeddingCache {
+  model: string;
+  entries: Array<{ name: string; embedding: number[] }>;
+}
+
+function cosine(a: number[], b: number[]): number {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+async function embed(texts: string[]): Promise<number[][]> {
+  const model = await getEmbedder();
+  const results: number[][] = [];
+  for (const text of texts) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const out: any = await model(text, { pooling: 'mean', normalize: true });
+    results.push(Array.from(out.data as Float32Array) as number[]);
+  }
+  return results;
+}
+
+const EMBEDDINGS_CACHE_PATH = '/workspace/group/workflows/.embeddings-cache.json';
+
+async function loadEmbeddingCache(registry: RegistryEntry[]): Promise<EmbeddingCache> {
+  // Return cache if model matches and all current entries are covered
+  try {
+    const cached = JSON.parse(fs.readFileSync(EMBEDDINGS_CACHE_PATH, 'utf-8')) as EmbeddingCache;
+    const cachedNames = new Set(cached.entries.map(e => e.name));
+    const allCovered = registry.every(e => cachedNames.has(e.name));
+    if (cached.model === EMBED_MODEL && allCovered) return cached;
+  } catch { /* cache missing or stale */ }
+
+  log('Building workflow embeddings cache...');
+  const embeddings = await embed(registry.map(e => `${e.name}: ${e.description}`));
+  const cache: EmbeddingCache = {
+    model: EMBED_MODEL,
+    entries: registry.map((e, i) => ({ name: e.name, embedding: embeddings[i] })),
+  };
+  fs.mkdirSync(path.dirname(EMBEDDINGS_CACHE_PATH), { recursive: true });
+  fs.writeFileSync(EMBEDDINGS_CACHE_PATH, JSON.stringify(cache));
+  return cache;
+}
+
+async function semanticSearch(query: string, registry: RegistryEntry[], topK = 4): Promise<RegistryEntry[]> {
+  const [cache, queryVec] = await Promise.all([
+    loadEmbeddingCache(registry),
+    embed([query]).then(v => v[0]),
+  ]);
+
+  const scored = cache.entries
+    .map(cached => ({
+      entry: registry.find(e => e.name === cached.name)!,
+      score: cosine(queryVec, cached.embedding),
+    }))
+    .filter(s => s.entry && s.score > 0.3)
+    .sort((a, b) => b.score - a.score);
+
+  return scored.slice(0, topK).map(s => s.entry);
+}
 
 // ─── Tool executor ────────────────────────────────────────────────────────────
 
@@ -534,6 +689,19 @@ async function executeTool(
         return 'Voice message queued for sending.';
       }
 
+      case 'ask_boss': {
+        const q = (args.question as string) || 'Need your input.';
+        const text = `Need your input: ${q}`;
+        writeIpcFile(IPC_MESSAGES_DIR, {
+          type: 'message',
+          chatJid: input.chatJid,
+          text,
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Question sent. Stop and wait for the user\'s reply in the next message.';
+      }
+
       case 'schedule_task': {
         const filename = writeIpcFile(IPC_TASKS_DIR, {
           type: 'schedule_task',
@@ -561,6 +729,58 @@ async function executeTool(
         return tasks.map(t =>
           `[${t.id}] ${t.prompt.slice(0, 60)} | ${t.schedule_type}: ${t.schedule_value} | ${t.status} | next: ${t.next_run ?? 'N/A'}`
         ).join('\n');
+      }
+
+      case 'list_workflows': {
+        const registryPath = '/workspace/group/workflows/registry.json';
+        if (!fs.existsSync(registryPath)) return 'No workflows registered yet. Create workflows/registry.json to add automations.';
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8')) as RegistryEntry[];
+        if (!registry.length) return 'Workflow registry is empty.';
+        return registry.map(e =>
+          `• ${e.name}: ${e.description}${e.args?.length ? ` | args: ${e.args.join(', ')}` : ''}`
+        ).join('\n');
+      }
+
+      case 'search_tools': {
+        const query = args.query as string;
+        const registryPath = '/workspace/group/workflows/registry.json';
+        if (!fs.existsSync(registryPath)) {
+          return 'No workflow registry found at workflows/registry.json. Create it to register automations.';
+        }
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8')) as RegistryEntry[];
+        const matches = await semanticSearch(query, registry);
+        if (!matches.length) return `No workflows matched "${query}". Available: ${registry.map(e => e.name).join(', ')}`;
+        return matches.map(e =>
+          `• ${e.name}: ${e.description}${e.args?.length ? ` | args: ${e.args.join(', ')}` : ''}`
+        ).join('\n');
+      }
+
+      case 'run_workflow': {
+        const name = args.name as string;
+        const registryPath = '/workspace/group/workflows/registry.json';
+        if (!fs.existsSync(registryPath)) return 'No workflow registry found.';
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8')) as Array<{
+          name: string; description: string; run: string;
+        }>;
+        const entry = registry.find(e => e.name === name);
+        if (!entry) return `Workflow "${name}" not found. Use search_tools to find available workflows.`;
+        const env = { ...process.env } as Record<string, string>;
+        if (args.args && typeof args.args === 'object') {
+          Object.assign(env, args.args as Record<string, string>);
+        }
+        log(`run_workflow: ${name} → ${entry.run}`);
+        try {
+          const { stdout, stderr } = await execAsync(entry.run, {
+            cwd: '/workspace/group/workflows',
+            env,
+            timeout: 60000,
+            maxBuffer: 5 * 1024 * 1024,
+          });
+          return [stdout, stderr ? `STDERR:\n${stderr}` : ''].filter(Boolean).join('\n') || '(no output)';
+        } catch (err) {
+          const e = err as { message: string; stdout?: string; stderr?: string };
+          return [e.stdout, e.stderr ? `STDERR:\n${e.stderr}` : '', `Error: ${e.message}`].filter(Boolean).join('\n');
+        }
       }
 
       case 'pause_task':
@@ -680,25 +900,49 @@ async function main(): Promise<void> {
   }
 
   const secrets = input.secrets ?? {};
-  const apiKey = secrets.OPENROUTER_API_KEY ?? 'no-key';
-  const modelName = secrets.MODEL_NAME ?? DEFAULT_MODEL;
-  const baseURL = secrets.OPENROUTER_BASE_URL ?? DEFAULT_BASE_URL;
-  if (secrets.GEMINI_API_KEY) {
-    process.env.GEMINI_API_KEY = secrets.GEMINI_API_KEY;
-    process.env.GOOGLE_API_KEY = secrets.GEMINI_API_KEY;
+  const geminiKey = secrets.GEMINI_API_KEY;
+  const openrouterKey = secrets.OPENROUTER_API_KEY;
+
+  let apiKey: string;
+  let baseURL: string;
+  let modelName: string;
+  let backend: Backend;
+
+  if (openrouterKey === 'ollama') {
+    apiKey = 'ollama';
+    baseURL = secrets.OPENROUTER_BASE_URL ?? 'http://host.docker.internal:11434/v1';
+    modelName = secrets.MODEL_NAME ?? 'llama3.2';
+    backend = 'ollama';
+  } else if (geminiKey) {
+    // Gemini API direct — takes priority when set (one AI, free)
+    apiKey = geminiKey;
+    baseURL = GEMINI_BASE_URL;
+    modelName = secrets.MODEL_NAME ?? GEMINI_DEFAULT_MODEL;
+    backend = 'gemini';
+  } else if (openrouterKey && openrouterKey !== 'no-key') {
+    apiKey = openrouterKey;
+    baseURL = secrets.OPENROUTER_BASE_URL ?? OPENROUTER_BASE_URL;
+    modelName = secrets.MODEL_NAME ?? OPENROUTER_DEFAULT_MODEL;
+    backend = 'openrouter';
+  } else {
+    apiKey = 'no-key';
+    baseURL = OPENROUTER_BASE_URL;
+    modelName = secrets.MODEL_NAME ?? OPENROUTER_DEFAULT_MODEL;
+    backend = 'openrouter';
   }
+
   delete input.secrets;
 
-  log(`Model: ${modelName} @ ${baseURL}`);
+  log(`Backend: ${backend} | Model: ${modelName} @ ${baseURL}`);
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL,
-    defaultHeaders: {
-      'HTTP-Referer': 'https://github.com/qwibitai/nanoclaw',
-      'X-Title': 'NanoClaw',
-    },
-  });
+  const clientOpts: ConstructorParameters<typeof OpenAI>[0] = { apiKey, baseURL };
+  if (backend === 'openrouter') {
+    clientOpts.defaultHeaders = {
+      'HTTP-Referer': 'https://github.com/kazGuido/stingyclaw',
+      'X-Title': 'Stingyclaw',
+    };
+  }
+  const client = new OpenAI(clientOpts);
 
   let session: Session = (input.sessionId ? loadSession(input.sessionId) : null) ?? newSession();
   log(`Session: ${session.id} (${session.messages.length} prior messages)`);

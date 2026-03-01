@@ -8,11 +8,12 @@ services:
     ports:
       - "127.0.0.1:8001:8001"
     volumes:
-      # Piper voice models persist across rebuilds (~63 MB each)
-      - voice-piper-models:/models/piper
+      # Qwen3-TTS and Whisper cache persist across rebuilds
+      - voice-models:/models
     environment:
-      WHISPER_MODEL: small      # whisper model is baked into the image
-      DEFAULT_VOICE: en_US-amy-medium
+      WHISPER_MODEL: small
+      TTS_MODEL: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice   # 0.6B for CPU; use 1.7B for quality
+      DEFAULT_SPEAKER: Ryan                             # Ryan, Aiden, Vivian, Serena, etc.
 
 volumes:
-  voice-piper-models:
+  voice-models:

@@ -35,6 +35,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { synthesizeSpeech } from './transcription.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -155,6 +156,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages);
 
+  // Enforce voice reply when user sent a voice message
+  const lastUserMessageWasVoice = missedMessages.some(
+    (m) => !m.is_from_me && m.content.trim().startsWith('[Voice:'),
+  );
+
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -190,8 +196,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+        // Enforce voice reply when user sent voice: send text as voice note instead of plain text
+        if (lastUserMessageWasVoice && channel.sendVoice) {
+          const audio = await synthesizeSpeech(text);
+          if (audio) {
+            await channel.sendVoice(chatJid, audio);
+            outputSentToUser = true;
+          } else {
+            await channel.sendMessage(chatJid, text);
+            outputSentToUser = true;
+          }
+        } else {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();

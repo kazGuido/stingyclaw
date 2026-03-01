@@ -11,7 +11,10 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, STORE_DIR } from '../config.js';
-import { WHATSAPP_VERSION } from '../whatsapp-version.js';
+import {
+  fetchAndPersistVersion,
+  getWhatsAppVersion,
+} from '../whatsapp-version.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -72,18 +75,18 @@ export class WhatsAppChannel implements Channel {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
-      version: WHATSAPP_VERSION,
+      version: getWhatsAppVersion(),
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Chrome'),
     });
 
-    this.sock.ev.on('connection.update', (update) => {
+    this.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         const msg =
-          'WhatsApp authentication required. Run /setup in Claude Code.';
+          'WhatsApp authentication required. Run: npx tsx setup/index.ts --step whatsapp-auth';
         logger.error(msg);
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
@@ -96,6 +99,17 @@ export class WhatsAppChannel implements Channel {
         const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
         logger.info({ reason, shouldReconnect, attempt: this.reconnectAttempts, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+
+        // 405/408 = outdated version or rate limit — fetch new version and exit so systemd restarts
+        if (reason === 405 || reason === 408) {
+          const newVersion = await fetchAndPersistVersion();
+          if (newVersion) {
+            logger.info({ version: newVersion }, 'Updated WhatsApp version due to 405; exiting for restart');
+          } else {
+            logger.warn('405/408 but could not fetch new version; exiting anyway');
+          }
+          process.exit(1);
+        }
 
         if (shouldReconnect) {
           const delay = reconnectDelay(this.reconnectAttempts);
