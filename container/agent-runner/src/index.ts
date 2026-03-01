@@ -829,9 +829,19 @@ async function runQuery(
 
     log(`Model call #${i + 1} (${session.messages.length} messages in history)`);
 
+    // Gemini's OpenAI-compatible endpoint rejects content:"" on assistant messages
+    // that have tool_calls. Strip empty string content before sending.
+    const sanitizedMessages = session.messages.map((m: any) => {
+      if (m.role === 'assistant' && m.tool_calls?.length && m.content === '') {
+        const { content, ...rest } = m;
+        return rest;
+      }
+      return m;
+    });
+
     const response = await client.chat.completions.create({
       model: modelName,
-      messages: [{ role: 'system', content: systemPrompt }, ...session.messages],
+      messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
       tools: TOOLS,
       tool_choice: 'auto',
       max_tokens: 8192,
