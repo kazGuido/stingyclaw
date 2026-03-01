@@ -24,7 +24,7 @@ GroupQueue → spawns Docker container per group
     │
     ▼
 Agent Container (nanoclaw-agent:latest)
-    ├── Primary model: Gemini API / OpenRouter / Ollama
+    ├── Primary model: OpenRouter / Ollama
     ├── Tool executor (Bash, Read, Write, Edit, Grep, Glob,
     │   WebFetch, agent-browser, send_message, send_voice,
     │   ask_boss, schedule_task, list_workflows, search_tools,
@@ -34,7 +34,7 @@ Agent Container (nanoclaw-agent:latest)
     ▼ IPC (file-based)
     │
     ├── send_message → WhatsApp text reply
-    └── send_voice → Voice Service (/synthesize, Qwen3-TTS) → WhatsApp PTT
+    └── send_voice → Voice Service (/synthesize, LFM2.5-Audio TTS) → WhatsApp PTT
 ```
 
 ---
@@ -121,10 +121,7 @@ The agent loop runs inside the container. It receives a JSON payload via stdin c
 
 Priority order (first key found wins):
 1. `OPENROUTER_API_KEY=ollama` → Ollama (local, fully offline)
-2. `GEMINI_API_KEY` set → Gemini API direct (`generativelanguage.googleapis.com/v1beta/openai/`)
-3. `OPENROUTER_API_KEY` set → OpenRouter
-
-Model name detection: if `MODEL_NAME` looks like an OpenRouter slug (contains `/` or `:`) but backend is Gemini, the agent automatically falls back to `gemini-2.5-flash`.
+2. `OPENROUTER_API_KEY` set → OpenRouter
 
 ### Agent Loop
 
@@ -192,11 +189,14 @@ A FastAPI Python service running in its own persistent Docker container.
 
 | Endpoint | Model | Input | Output |
 |----------|-------|-------|--------|
-| `POST /transcribe` | Whisper-small (CPU) | Audio bytes (any format) | `{"text": "..."}` |
-| `POST /synthesize` | Qwen3-TTS (CPU) | `{"text": "..."}` | OGG audio bytes |
+| `POST /transcribe` | LFM2.5-Audio-1.5B (GGUF, CPU) | Audio file upload | `{"text": "..."}` |
+| `POST /synthesize` | LFM2.5-Audio-1.5B (GGUF, CPU) | `{"text": "..."}` | OGG audio bytes |
 | `GET /health` | — | — | `{"status": "ok"}` |
 
-Models are downloaded on first use and cached in a Docker volume (`voice-models`).
+- Backbone: llama.cpp compatible GGUF via `llama-cpp-python` — CPU efficient, no heavy PyTorch inference
+- Audio codec: FastConformer encoder + Mimi detokenizer (CPU PyTorch)
+- Single model handles both ASR and TTS — no separate Whisper
+- Model downloaded on first request, cached in Docker volume (`voice-models`)
 
 ---
 
@@ -295,7 +295,7 @@ groups/
 | Image | Size | Purpose |
 |-------|------|---------|
 | `nanoclaw-agent:latest` | ~2.5GB | Agent runner (Node + ripgrep + Chromium + embedding model) |
-| `stingyclaw-voice:latest` | ~3.5GB | Voice service (Python + PyTorch + Whisper + Qwen3-TTS) |
+| `stingyclaw-voice:latest` | ~3GB | Voice service (LFM2.5-Audio-1.5B GGUF — handles ASR + TTS) |
 
 Agent image is rebuilt with:
 ```bash
@@ -316,11 +316,10 @@ All config lives in `.env`:
 
 ```bash
 # Model backend (auto-detected by priority)
-GEMINI_API_KEY=AIza...          # Option 1: Gemini direct (free)
-OPENROUTER_API_KEY=sk-or-v1-... # Option 2: OpenRouter (100+ models)
-# OPENROUTER_API_KEY=ollama     # Option 3: local Ollama
+OPENROUTER_API_KEY=sk-or-v1-... # OpenRouter (100+ models, free tiers available)
+# OPENROUTER_API_KEY=ollama     # Or: local Ollama
 
-MODEL_NAME=gemini-2.5-flash     # Must match backend (no OpenRouter slugs for Gemini)
+MODEL_NAME=stepfun/step-3.5-flash:free  # Any OpenRouter model slug
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 ASSISTANT_NAME=Clawman           # Trigger word @Clawman

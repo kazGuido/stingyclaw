@@ -51,7 +51,7 @@ A personal AI assistant accessible via WhatsApp, with local voice, persistent me
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    AGENT RUNNER                               │   │
 │  │                                                               │   │
-│  │  Model: Gemini API / OpenRouter / Ollama                      │   │
+│  │  Model: OpenRouter / Ollama                                   │   │
 │  │  Volume mounts:                                               │   │
 │  │    • groups/{name}/  → /workspace/group  (rw)                 │   │
 │  │    • groups/global/  → /workspace/global (ro)                 │   │
@@ -71,7 +71,7 @@ A personal AI assistant accessible via WhatsApp, with local voice, persistent me
          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │              VOICE SERVICE (Docker, persistent)                      │
-│  FastAPI: /transcribe (Whisper-small) + /synthesize (Qwen3-TTS)     │
+│  FastAPI: /transcribe + /synthesize (LFM2.5-Audio-1.5B GGUF)        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,10 +83,10 @@ A personal AI assistant accessible via WhatsApp, with local voice, persistent me
 | Message Storage | SQLite (better-sqlite3) | Store messages for polling |
 | Container Runtime | Docker | Isolated agent execution |
 | Agent Loop | Plain OpenAI-compatible loop (`openai` package) | Model calls + tool execution |
-| Model Backend | Gemini API / OpenRouter / Ollama | LLM inference |
+| Model Backend | OpenRouter / Ollama | LLM inference |
 | Browser Automation | agent-browser + Chromium (Playwright) | Web interaction |
 | Voice ASR | faster-whisper (Whisper-small, CPU) | Voice note transcription |
-| Voice TTS | Qwen3-TTS (CPU) | Natural voice synthesis |
+| Voice ASR + TTS | LFM2.5-Audio-1.5B GGUF (CPU) | Speech-to-speech via single model |
 | Semantic Search | @xenova/transformers (all-MiniLM-L6-v2) | Workflow discovery |
 
 ---
@@ -127,12 +127,10 @@ stingyclaw/
 `.env` file:
 
 ```bash
-# Model backend (first set wins)
-GEMINI_API_KEY=AIza...              # Gemini direct (free, recommended)
-# OPENROUTER_API_KEY=sk-or-v1-...  # OpenRouter alternative
-# OPENROUTER_API_KEY=ollama        # Local Ollama
+OPENROUTER_API_KEY=sk-or-v1-...     # OpenRouter (100+ models, free tiers)
+# OPENROUTER_API_KEY=ollama         # Or: local Ollama
 
-MODEL_NAME=gemini-2.5-flash         # Must match backend
+MODEL_NAME=stepfun/step-3.5-flash:free  # Any OpenRouter model slug
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 ASSISTANT_NAME=Clawman              # Trigger: @Clawman
@@ -140,10 +138,9 @@ TZ=Europe/Brussels                  # Timezone for container
 ```
 
 **Model name rules:**
-- For Gemini: use `gemini-2.5-flash`, `gemini-2.5-pro`, etc.
-- For OpenRouter: use slugs like `meta-llama/llama-3.3-70b-instruct:free`
+- For OpenRouter: use slugs like `stepfun/step-3.5-flash:free`, `meta-llama/llama-3.3-70b-instruct:free`
 - For Ollama: use model names like `llama3.2`
-- If you set a Gemini key but leave an OpenRouter-style slug in `MODEL_NAME`, the agent auto-falls back to `gemini-2.5-flash`
+- Browse free models at [openrouter.ai/models?order=top-weekly&supported_parameters=tools](https://openrouter.ai/models?order=top-weekly&supported_parameters=tools)
 
 ---
 
@@ -345,9 +342,9 @@ The agent is instructed to reply with `send_voice` when the user sent a voice no
 
 ### Output (TTS)
 
-`send_voice` → POST `/synthesize` to voice service → Qwen3-TTS generates audio → OGG file → WhatsApp PTT (push-to-talk) voice note.
+`send_voice` → POST `/synthesize` to voice service → LFM2.5-Audio generates audio (GGUF, CPU) → OGG file → WhatsApp PTT voice note.
 
-First synthesis is slow (~30-60s on CPU) because the model downloads on first use. Subsequent calls are faster.
+First synthesis is slow (model downloads ~3GB on first use). Subsequent calls are faster.
 
 ---
 
@@ -359,7 +356,7 @@ First synthesis is slow (~30-60s on CPU) because the model downloads on first us
 git clone https://github.com/kazGuido/stingyclaw.git
 cd stingyclaw
 cp .env.example .env
-# Edit .env — set GEMINI_API_KEY (or OPENROUTER_API_KEY)
+# Edit .env — set OPENROUTER_API_KEY + MODEL_NAME
 
 bash setup.sh                          # check deps
 npx tsx setup/index.ts --step container -- --runtime docker   # build agent image

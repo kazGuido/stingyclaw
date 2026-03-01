@@ -1,12 +1,9 @@
 /**
  * Stingyclaw Agent Runner
  *
- * OpenAI-compatible agentic loop. Supports three backends:
- *   1. OpenRouter (default)  — set OPENROUTER_API_KEY + MODEL_NAME
- *   2. Local Ollama          — set OPENROUTER_API_KEY=ollama
- *   3. Gemini API (fallback) — set GEMINI_API_KEY (only if no OPENROUTER_API_KEY)
- *
- * Priority: OPENROUTER_API_KEY > GEMINI_API_KEY
+ * OpenAI-compatible agentic loop. Two backends:
+ *   1. OpenRouter — set OPENROUTER_API_KEY + MODEL_NAME (default)
+ *   2. Local Ollama — set OPENROUTER_API_KEY=ollama
  */
 
 import fs from 'fs';
@@ -37,12 +34,10 @@ const IPC_POLL_MS = 500;
 const SESSIONS_DIR = '/home/node/.stingyclaw/sessions';
 const MAX_TOOL_ITERATIONS = 60;
 
-const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/';
-const GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const OPENROUTER_DEFAULT_MODEL = 'liquid/lfm-2.5';
 
-type Backend = 'gemini' | 'openrouter' | 'ollama';
+type Backend = 'openrouter' | 'ollama';
 
 // ─── Local embedder (lazy-loaded, shared across tool calls) ──────────────────
 
@@ -828,13 +823,11 @@ async function runQuery(
 
     log(`Model call #${i + 1} (${session.messages.length} messages in history)`);
 
-    // Gemini's OpenAI-compatible endpoint is strict about message shape:
-    // - Rejects content:"" on assistant messages that have tool_calls
-    // - Rejects null values for unknown fields like refusal, reasoning, reasoning_details
+    // Strip provider-specific nulls (refusal, reasoning_details) and empty content
+    // from assistant messages before sending — keeps the history clean regardless of model.
     const sanitizedMessages = session.messages.map((m: any) => {
       if (m.role !== 'assistant') return m;
       const cleaned: any = { role: m.role };
-      // Only include content if it's a non-empty string
       if (typeof m.content === 'string' && m.content !== '') cleaned.content = m.content;
       if (m.tool_calls?.length) cleaned.tool_calls = m.tool_calls;
       return cleaned;
@@ -851,8 +844,7 @@ async function runQuery(
       });
     } catch (err: any) {
       const msg = err?.message ?? '';
-      // Gemini rejects sessions with turn-ordering violations or token overflow.
-      // Trim to the last 10 messages and retry once before giving up.
+      // On 400 with a long session, trim to last 10 messages and retry once.
       if (msg.includes('400') && session.messages.length > 10) {
         log(`API 400 with ${session.messages.length} messages — trimming session to last 10 and retrying`);
         session.messages = session.messages.slice(-10);
@@ -925,7 +917,6 @@ async function main(): Promise<void> {
   }
 
   const secrets = input.secrets ?? {};
-  const geminiKey = secrets.GEMINI_API_KEY;
   const openrouterKey = secrets.OPENROUTER_API_KEY;
 
   let apiKey: string;
@@ -938,23 +929,9 @@ async function main(): Promise<void> {
     baseURL = secrets.OPENROUTER_BASE_URL ?? 'http://host.docker.internal:11434/v1';
     modelName = secrets.MODEL_NAME ?? 'llama3.2';
     backend = 'ollama';
-  } else if (openrouterKey && openrouterKey !== 'no-key') {
-    // OpenRouter takes priority — this is the primary backend
-    apiKey = openrouterKey;
-    baseURL = secrets.OPENROUTER_BASE_URL ?? OPENROUTER_BASE_URL;
-    modelName = secrets.MODEL_NAME ?? OPENROUTER_DEFAULT_MODEL;
-    backend = 'openrouter';
-  } else if (geminiKey) {
-    // Gemini fallback — only used when no OPENROUTER_API_KEY is set
-    apiKey = geminiKey;
-    baseURL = GEMINI_BASE_URL;
-    const rawModel = secrets.MODEL_NAME;
-    const looksLikeOpenRouter = rawModel && (rawModel.includes('/') || rawModel.includes(':'));
-    modelName = looksLikeOpenRouter ? GEMINI_DEFAULT_MODEL : (rawModel ?? GEMINI_DEFAULT_MODEL);
-    backend = 'gemini';
   } else {
-    apiKey = 'no-key';
-    baseURL = OPENROUTER_BASE_URL;
+    apiKey = openrouterKey ?? 'no-key';
+    baseURL = secrets.OPENROUTER_BASE_URL ?? OPENROUTER_BASE_URL;
     modelName = secrets.MODEL_NAME ?? OPENROUTER_DEFAULT_MODEL;
     backend = 'openrouter';
   }

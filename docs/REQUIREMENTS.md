@@ -8,7 +8,7 @@ Original requirements and design decisions — updated to reflect the current fo
 
 [NanoClaw](https://github.com/qwibitai/nanoclaw) gave us the core: a personal AI assistant that lives in WhatsApp, runs agents in isolated Docker containers, and uses file-based IPC to keep things simple. The problem was it required a paid Anthropic subscription and was locked to Claude via a proprietary SDK.
 
-**Stingyclaw** removes that dependency entirely. The agent loop is a plain `openai`-package implementation that works with any OpenAI-compatible endpoint — Gemini API (free), OpenRouter (100+ models, free tiers), or local Ollama. Zero paid API requirements.
+**Stingyclaw** removes that dependency entirely. The agent loop is a plain `openai`-package implementation that works with any OpenAI-compatible endpoint — OpenRouter (100+ models, free tiers) or local Ollama. Zero paid API requirements.
 
 The name is a pun: stingy, as in unwilling to pay for AI.
 
@@ -47,10 +47,10 @@ Instead of adding every capability to the agent runner, define shell scripts and
 A personal AI assistant accessible via WhatsApp, with no paid API requirements and full local control.
 
 **Core components:**
-- **Model-agnostic agent loop** — Gemini API, OpenRouter, or Ollama
+- **Model-agnostic agent loop** — OpenRouter or local Ollama
 - **Docker containers** for isolated agent execution
 - **WhatsApp** as the primary I/O channel
-- **Voice in/out** — Whisper ASR + Qwen3-TTS, fully local
+- **Voice in/out** — LFM2.5-Audio-1.5B GGUF (single model for ASR + TTS, CPU)
 - **Persistent memory** per group (`MISSION.md`)
 - **Scheduled tasks** that run the agent and message back
 - **Web access** — WebFetch for static, `agent-browser` (Playwright/Chromium) for JS-heavy pages
@@ -134,7 +134,7 @@ A personal AI assistant accessible via WhatsApp, with no paid API requirements a
 
 ### Voice
 - Whisper-small (ASR): faster-whisper, CPU inference
-- Qwen3-TTS (TTS): natural LLM-based voice, CPU inference
+- LFM2.5-Audio-1.5B (GGUF): single model for both ASR and TTS, CPU via llama-cpp-python
 - Both run in a persistent Docker container via FastAPI
 
 ### Scheduler
@@ -160,7 +160,7 @@ A personal AI assistant accessible via WhatsApp, with no paid API requirements a
 - Linux (recommended) or macOS
 - Node.js 22+
 - Docker + Docker Compose
-- Gemini API key (free at [aistudio.google.com](https://aistudio.google.com)) — or OpenRouter/Ollama
+- OpenRouter API key (free at [openrouter.ai](https://openrouter.ai)) — or local Ollama
 
 ---
 

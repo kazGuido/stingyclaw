@@ -24,7 +24,7 @@ No SDK. No subprocess. One file, one loop, easy to reason about.
 stdin → JSON payload
   {
     group, sessionId, groupFolder, chatJid, isMain,
-    assistantName, prompt, secrets: { GEMINI_API_KEY, MODEL_NAME, ... }
+    assistantName, prompt, secrets: { OPENROUTER_API_KEY, MODEL_NAME, ... }
   }
 ```
 
@@ -40,14 +40,8 @@ if (openrouterKey === 'ollama') {
   baseURL = OPENROUTER_BASE_URL ?? 'http://host.docker.internal:11434/v1'
   modelName = MODEL_NAME ?? 'llama3.2'
 
-} else if (geminiKey) {
-  // Gemini API — takes priority when set
-  baseURL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
-  // Auto-detect OpenRouter slugs (contain / or :) and fall back to gemini-2.5-flash
-  modelName = looksLikeOpenRouter(MODEL_NAME) ? 'gemini-2.5-flash' : MODEL_NAME
-
-} else if (openrouterKey) {
-  // OpenRouter
+} else {
+  // OpenRouter (default)
   baseURL = OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1'
   modelName = MODEL_NAME ?? 'liquid/lfm-2.5'
 }

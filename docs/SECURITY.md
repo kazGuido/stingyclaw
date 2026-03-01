@@ -75,7 +75,6 @@ delete input.secrets  // removed from memory immediately
 
 **Allowed credentials (read from `.env`, passed via stdin):**
 ```
-GEMINI_API_KEY
 OPENROUTER_API_KEY
 MODEL_NAME
 OPENROUTER_BASE_URL

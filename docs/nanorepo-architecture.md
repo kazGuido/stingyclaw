@@ -27,8 +27,8 @@ stingyclaw/
 │   │   ├── download-embed-model.mjs  # Pre-downloads all-MiniLM-L6-v2 at image build time
 │   │   └── package.json          # Agent runner deps (@xenova/transformers, openai, etc.)
 │   └── voice-service/
-│       ├── Dockerfile            # Voice image (Python + PyTorch + Whisper + Qwen3-TTS)
-│       ├── server.py             # FastAPI: /transcribe (Whisper) + /synthesize (Qwen3-TTS)
+│       ├── Dockerfile            # Voice image (LFM2.5-Audio GGUF + llama-cpp-python)
+│       ├── server.py             # FastAPI: /transcribe + /synthesize (LFM2.5-Audio-1.5B)
 │       └── requirements.txt
 │
 ├── groups/
@@ -96,8 +96,8 @@ The agent discovers it automatically via `search_tools`.
 Edit `.env`:
 ```bash
 # Use Gemini (free, recommended)
-GEMINI_API_KEY=AIza...
-MODEL_NAME=gemini-2.5-flash
+OPENROUTER_API_KEY=sk-or-v1-...
+MODEL_NAME=stepfun/step-3.5-flash:free
 
 # Use OpenRouter
 OPENROUTER_API_KEY=sk-or-v1-...

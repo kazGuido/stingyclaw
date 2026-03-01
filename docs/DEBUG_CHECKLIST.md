@@ -58,7 +58,7 @@ docker ps -a --format '{{.Names}} {{.Status}}' | grep nanoclaw
 
 # Test run the agent image manually with dummy input
 echo '{"group":"main","message":"test","history":[]}' | docker run --rm -i \
-  -e GEMINI_API_KEY=test \
+  -e OPENROUTER_API_KEY=test \
   nanoclaw-agent:latest 2>&1 | head -20
 
 # Check image build date vs last code change
@@ -91,15 +91,16 @@ docker logs stingyclaw-voice --tail 20
 
 ---
 
-## Gemini API / Model Issues
+## OpenRouter / Model Issues
 
 ```bash
-# Test Gemini API key directly
-GEMINI_KEY=$(grep GEMINI_API_KEY .env | cut -d= -f2)
-curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" \
-  -H "Authorization: Bearer $GEMINI_KEY" \
+# Test OpenRouter API key directly
+OR_KEY=$(grep OPENROUTER_API_KEY .env | cut -d= -f2)
+MODEL=$(grep MODEL_NAME .env | cut -d= -f2)
+curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+  -H "Authorization: Bearer $OR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"ping"}]}' | python3 -m json.tool
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" | python3 -m json.tool
 
 # Check what model and backend the agent is using
 grep 'Backend:' logs/nanoclaw.log | tail -5
@@ -179,8 +180,8 @@ tail -f logs/nanoclaw.error.log
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
 | `400 status code (no body)` from Gemini | Session has OpenAI-specific fields (`refusal: null`) or bad turn ordering | Reset session messages to `[]` |
-| `MODEL_NAME` not working | OpenRouter slug sent to Gemini endpoint | Agent auto-detects and falls back to `gemini-2.5-flash` |
+| `MODEL_NAME` model not found | Model slug not available on OpenRouter | Check [openrouter.ai/models](https://openrouter.ai/models) for exact slug |
 | Max retries exceeded, you get WhatsApp error notification | API key wrong, model unavailable, or corrupt session | Check API key, reset session |
-| Voice container crashed on first synthesis | Qwen3-TTS model downloading (lazy load) | Wait 2-3 min for first synthesis, check `docker logs stingyclaw-voice` |
+| Voice slow on first request | LFM2.5-Audio model downloading (~3GB) | Wait for download, check `docker logs stingyclaw-voice` |
 | `container: command not found` in agent | Apple Container not installed (only relevant for macOS users) | Use Docker — the project uses `docker` by default |
 | Agent container rebuilds too slow | `--no-cache` rebuilds everything | Without `--no-cache`, cached layers are reused; source is mounted at runtime anyway |
