@@ -3,15 +3,23 @@
 </p>
 
 <p align="center">
-  Personal WhatsApp AI assistant — model-agnostic, container-isolated, locally voiced, extensible via workflows.
+  <strong>Your personal WhatsApp AI — free models, real voice, real automation.</strong><br>
+  Because great AI shouldn't require a corporate credit card.
 </p>
 
 ---
 
-> **Fork of [qwibitai/nanoclaw](https://github.com/qwibitai/nanoclaw)** — original by [@gavrielc](https://github.com/gavrielc).
-> Stingyclaw replaces the proprietary Claude SDK with a plain OpenAI-compatible agent loop,
-> adds local voice in/out, a semantic workflow registry, and full browser automation —
-> all with zero paid API requirements.
+## The story
+
+[NanoClaw](https://github.com/qwibitai/nanoclaw) is a brilliant little project: a personal AI assistant that lives in WhatsApp, runs in a Docker container, and uses Claude to do the thinking. The problem? Claude costs money. Real money. And the agent SDK it used was proprietary, locking you into Anthropic's ecosystem entirely.
+
+**Stingyclaw** is the broke developer's fork.
+
+The goal was simple: rip out everything that requires a paid subscription, replace it with free alternatives that are *actually good*, and add the features we actually wanted — voice notes in and out, a browser that handles real websites, and a way to define custom automations without writing a new tool every time.
+
+The result: a WhatsApp assistant that runs on free Gemini API credits, speaks and listens locally, browses the web like a real browser, and can execute your own shell scripts on command — all from your phone, all containerized, all yours.
+
+The name? Stingyclaw is a play on being stingy. We took the claw and made it pinch pennies.
 
 ---
 
@@ -24,8 +32,8 @@
 | **Docker image** | ~1.5GB | ~2GB (includes Chromium for browser automation) |
 | **Cost** | Requires paid Anthropic access | Free tier on Gemini/OpenRouter, or fully local |
 | **Voice input** | Not supported | ✅ Local Whisper ASR |
-| **Voice output** | Not supported | ✅ Local Qwen3-TTS |
-| **Browser** | Not supported | ✅ `agent-browser` (Playwright-based, JS-capable) |
+| **Voice output** | Not supported | ✅ Local Qwen3-TTS (natural, LLM-based) |
+| **Browser** | Not supported | ✅ `agent-browser` (Playwright/Chromium, JS-capable) |
 | **Workflows** | Not supported | ✅ Semantic registry — shell scripts as automations |
 | **Memory files** | `CLAUDE.md` | `MISSION.md` (model-agnostic) |
 
@@ -74,7 +82,18 @@ GEMINI_API_KEY=AIza...          # free at aistudio.google.com
 
 ---
 
-## Architecture
+## How it works
+
+When you send a WhatsApp message (or voice note), here's what happens:
+
+1. **Voice?** → transcribed locally by Whisper (no cloud, no cost)
+2. **Text lands in SQLite** → the host polling loop picks it up
+3. **A Docker container spawns** for that group — isolated, ephemeral
+4. **The agent loop runs** — the model picks tools, runs them, loops until done
+5. **Reply goes out** — text or voice (Qwen3-TTS renders natural speech locally)
+6. **Container exits** — sessions are saved, resumed next time
+
+Every group is fully isolated: its own container, its own files, its own `MISSION.md` persona, its own workflow scripts.
 
 ```
 WhatsApp message
@@ -94,8 +113,7 @@ Agent Container (Docker, isolated per-group)
 Voice Service → Qwen3-TTS → OGG → WhatsApp PTT reply
 ```
 
-One Node.js host process. Each message spawns an isolated Docker container.
-The container exits after the conversation goes idle. Sessions are persisted and resumed.
+One Node.js host process. Each message spawns an isolated Docker container. The container exits after the conversation goes idle. Sessions are persisted and resumed.
 
 ---
 
@@ -130,9 +148,9 @@ The container exits after the conversation goes idle. Sessions are persisted and
   agent-browser screenshot page.png
   ```
 
-### Workflow registry
+### Workflow registry — your personal automation library
 
-Pre-built automations the agent discovers via semantic search. The agent automatically tries `search_tools` before falling back to built-ins.
+This is where Stingyclaw gets interesting. Instead of hardcoding every capability into the agent, you drop shell scripts into `groups/*/workflows/` and register them in a `registry.json`. The agent discovers them automatically using **semantic search** — no keywords, no exact matching, just intent.
 
 ```
 groups/main/
@@ -160,13 +178,12 @@ groups/main/
 ]
 ```
 
-Scripts can be bash, Python, Node — anything executable. Arguments arrive as environment variables.
-Embeddings are computed locally (`all-MiniLM-L6-v2`, baked into image) and cached in `.embeddings-cache.json`.
+Scripts can be bash, Python, Node — anything executable. Arguments arrive as environment variables. Embeddings are computed locally (`all-MiniLM-L6-v2`, baked into image) and cached in `.embeddings-cache.json`.
 
-**Decision flow:**
+**The agent's decision flow:**
 ```
 User: "morning briefing"
-  → search_tools("morning briefing")  [semantic match]
+  → search_tools("morning briefing")  [semantic match → found]
   → run_workflow("morning-briefing")
   → bash morning-briefing.sh
   → reply
@@ -176,9 +193,11 @@ User: "what's the capital of France?"
   → model answers directly
 ```
 
+The agent never has a bloated system prompt full of workflow details. It looks things up when it needs them, exactly like a person would.
+
 ### Per-group memory (`MISSION.md`)
 
-Each group has a `groups/{name}/MISSION.md` injected into the system prompt. Keep it short — it's sent on every request. For larger reference data, let the agent `Read` files on demand.
+Each group has a `groups/{name}/MISSION.md` injected into the system prompt. This is where you give the agent its persona, context, and standing instructions for that group. Keep it short — it's sent on every request. For larger reference data, let the agent `Read` files on demand.
 
 ---
 
@@ -203,10 +222,12 @@ Each group has a `groups/{name}/MISSION.md` injected into the system prompt. Kee
 
 ## Roadmap / what to build next
 
+The current build is a solid foundation. Here's what comes next:
+
 - **MCP client** — connect to any MCP server (Gmail, GitHub, Slack) for dynamic tool loading without code changes
-- **Richer workflow args** — typed inputs, validation, prompting for missing args
+- **Richer workflow args** — typed inputs, validation, prompting for missing args before running
 - **n8n / webhook bridge** — call external automation platforms from registry scripts
-- **Group onboarding** — auto-prompt new groups for their mission/context
+- **Group onboarding** — auto-prompt new groups for their mission/context on first message
 - **Per-group agent customization** — groups can modify their own agent-runner source (already mounted writable)
 - **Embeddings for memory** — semantic search over conversation history, not just workflows
 
