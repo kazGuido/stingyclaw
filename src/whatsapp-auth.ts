@@ -19,6 +19,8 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
+import { WHATSAPP_VERSION } from './whatsapp-version.js';
+
 const AUTH_DIR = './store/auth';
 const QR_FILE = './store/qr-data.txt';
 const STATUS_FILE = './store/auth-status.txt';
@@ -58,6 +60,7 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
+    version: WHATSAPP_VERSION,
     printQRInTerminal: false,
     logger,
     browser: Browsers.macOS('Chrome'),

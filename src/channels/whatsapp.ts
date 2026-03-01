@@ -11,6 +11,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, STORE_DIR } from '../config.js';
+import { WHATSAPP_VERSION } from '../whatsapp-version.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -71,6 +72,7 @@ export class WhatsAppChannel implements Channel {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
+      version: WHATSAPP_VERSION,
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Chrome'),

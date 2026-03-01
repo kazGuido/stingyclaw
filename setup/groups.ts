@@ -112,6 +112,7 @@ const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
 const sock = makeWASocket({
   auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+  version: [2, 3000, 1034270928],
   printQRInTerminal: false,
   logger,
   browser: Browsers.macOS('Chrome'),
