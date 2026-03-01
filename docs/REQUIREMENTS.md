@@ -1,14 +1,16 @@
-# NanoClaw Requirements
+# Stingyclaw Requirements
 
-Original requirements and design decisions from the project creator.
+Original requirements and design decisions — updated to reflect the current fork.
 
 ---
 
 ## Why This Exists
 
-This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in isolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
+[NanoClaw](https://github.com/qwibitai/nanoclaw) gave us the core: a personal AI assistant that lives in WhatsApp, runs agents in isolated Docker containers, and uses file-based IPC to keep things simple. The problem was it required a paid Anthropic subscription and was locked to Claude via a proprietary SDK.
 
-NanoClaw gives you the core functionality without that mess.
+**Stingyclaw** removes that dependency entirely. The agent loop is a plain `openai`-package implementation that works with any OpenAI-compatible endpoint — Gemini API (free), OpenRouter (100+ models, free tiers), or local Ollama. Zero paid API requirements.
+
+The name is a pun: stingy, as in unwilling to pay for AI.
 
 ---
 
@@ -16,71 +18,49 @@ NanoClaw gives you the core functionality without that mess.
 
 ### Small Enough to Understand
 
-The entire codebase should be something you can read and understand. One Node.js process. A handful of source files. No microservices, no message queues, no abstraction layers.
+One Node.js host process. A handful of source files. No microservices, no message queues, no abstraction layers. The entire `src/` directory is under 600 lines of meaningful logic.
 
 ### Security Through True Isolation
 
-Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your Mac.
+Agents run in actual Linux containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on the host.
 
 ### Built for One User
 
-This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add the integrations I actually want, not every possible integration.
+This is working software for personal use, not a platform or framework. It supports WhatsApp because that's what the original author used. Add what you need, cut what you don't.
 
 ### Customization = Code Changes
 
-No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
+No configuration sprawl. If you want different behavior, change the code. The codebase is small enough that this is safe and practical. Very few things are in config — mostly API keys and the trigger word.
 
 ### AI-Native Development
 
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
+You have a capable AI collaborator (the bot itself, Cursor, etc.). The codebase doesn't need to be excessively self-documenting or self-healing. Describe a problem, fix it. The agent can help debug itself.
 
-The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
+### Workflows Over Hardcoded Features
 
-### Skills Over Features
-
-When people contribute, they shouldn't add "Telegram support alongside WhatsApp." They should contribute a skill like `/add-telegram` that transforms the codebase. Users fork the repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
-
----
-
-## RFS (Request for Skills)
-
-Skills we'd love contributors to build:
-
-### Communication Channels
-Skills to add or switch to different messaging platforms:
-- `/add-telegram` - Add Telegram as an input channel
-- `/add-slack` - Add Slack as an input channel
-- `/add-discord` - Add Discord as an input channel
-- `/add-sms` - Add SMS via Twilio or similar
-- `/convert-to-telegram` - Replace WhatsApp with Telegram entirely
-
-### Container Runtime
-The project uses Docker by default (cross-platform). For macOS users who prefer Apple Container:
-- `/convert-to-apple-container` - Switch from Docker to Apple Container (macOS-only)
-
-### Platform Support
-- `/setup-linux` - Make the full setup work on Linux (depends on Docker conversion)
-- `/setup-windows` - Windows support via WSL2 + Docker
+Instead of adding every capability to the agent runner, define shell scripts and register them in `registry.json`. The agent discovers them via semantic search and executes them as needed. A morning briefing, a Slack notification, a CRM pull — all just scripts.
 
 ---
 
 ## Vision
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+A personal AI assistant accessible via WhatsApp, with no paid API requirements and full local control.
 
 **Core components:**
-- **Claude Agent SDK** as the core agent
-- **Containers** for isolated agent execution (Linux VMs)
+- **Model-agnostic agent loop** — Gemini API, OpenRouter, or Ollama
+- **Docker containers** for isolated agent execution
 - **WhatsApp** as the primary I/O channel
-- **Persistent memory** per conversation and globally
-- **Scheduled tasks** that run Claude and can message back
-- **Web access** for search and browsing
-- **Browser automation** via agent-browser
+- **Voice in/out** — Whisper ASR + Qwen3-TTS, fully local
+- **Persistent memory** per group (`MISSION.md`)
+- **Scheduled tasks** that run the agent and message back
+- **Web access** — WebFetch for static, `agent-browser` (Playwright/Chromium) for JS-heavy pages
+- **Workflow registry** — shell scripts as semantic automations
 
 **Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
-- Minimal glue code
-- File-based systems where possible (CLAUDE.md for memory, folders for groups)
+- Standard `openai` npm package for model calls (OpenAI-compatible)
+- File-based IPC between host and containers
+- `MISSION.md` for per-group memory (model-agnostic replacement for `CLAUDE.md`)
+- Minimal glue code — the agent loop is ~1000 lines including all tools
 
 ---
 
@@ -89,48 +69,58 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ### Message Routing
 - A router listens to WhatsApp and routes messages based on configuration
 - Only messages from registered groups are processed
-- Trigger: `@Andy` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
+- Trigger: `@{ASSISTANT_NAME}` prefix (configurable via env var)
 - Unregistered groups are ignored completely
 
 ### Memory System
-- **Per-group memory**: Each group has a folder with its own `CLAUDE.md`
-- **Global memory**: Root `CLAUDE.md` is read by all groups, but only writable from "main" (self-chat)
-- **Files**: Groups can create/read files in their folder and reference them
-- Agent runs in the group's folder, automatically inherits both CLAUDE.md files
+- **Per-group memory**: Each group has a `groups/{name}/MISSION.md`
+- **Global memory**: `groups/global/MISSION.md` is read by all groups, writable only from "main" (self-chat)
+- **Files**: Groups can create/read files in their folder
+- Agent runs in the group's folder, both MISSION.md files are injected into the system prompt
 
 ### Session Management
-- Each group maintains a conversation session (via Claude Agent SDK)
-- Sessions auto-compact when context gets too long, preserving critical information
+- Each group maintains a conversation session as a JSON file
+- Sessions persist across container restarts
+- Session trimming on API errors (auto-trim to last 10 messages on Gemini 400)
+- Message sanitization: strips OpenAI-specific fields before sending to Gemini
 
 ### Container Isolation
-- All agents run inside containers (lightweight Linux VMs)
+- All agents run inside Docker containers
 - Each agent invocation spawns a container with mounted directories
-- Containers provide filesystem isolation - agents can only see mounted paths
+- Containers provide filesystem isolation — agents can only see mounted paths
 - Bash access is safe because commands run inside the container, not on the host
-- Browser automation via agent-browser with Chromium in the container
+- `agent-browser` (Playwright/Chromium) for full browser automation inside the container
 
 ### Scheduled Tasks
-- Users can ask Claude to schedule recurring or one-time tasks from any group
+- Users can ask the agent to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them
-- Tasks have access to all tools including Bash (safe in container)
-- Tasks can optionally send messages to their group via `send_message` tool, or complete silently
-- Task runs are logged to the database with duration and result
+- Tasks can send messages to their group via `send_message` tool, or complete silently
 - Schedule types: cron expressions, intervals (ms), or one-time (ISO timestamp)
-- From main: can schedule tasks for any group, view/manage all tasks
-- From other groups: can only manage that group's tasks
+- Main group can manage tasks for all groups; other groups manage their own only
+
+### Workflow Registry
+- Per-group `workflows/registry.json` indexes available shell scripts
+- Agent uses semantic search (local embeddings) to find relevant workflows
+- Scripts run with args passed as environment variables
+- Works offline — embedding model is baked into the agent image
 
 ### Group Management
-- New groups are added explicitly via the main channel
-- Groups are registered in SQLite (via the main channel or IPC `register_group` command)
+- New groups are added explicitly via the main channel or setup CLI
+- Groups are registered in SQLite
 - Each group gets a dedicated folder under `groups/`
 - Groups can have additional directories mounted via `containerConfig`
 
 ### Main Channel Privileges
 - Main channel is the admin/control group (typically self-chat)
-- Can write to global memory (`groups/CLAUDE.md`)
+- Can write to global memory (`groups/global/MISSION.md`)
 - Can schedule tasks for any group
 - Can view and manage tasks from all groups
 - Can configure additional directory mounts for any group
+
+### Error Handling
+- On agent failure: exponential backoff retry (5s → 10s → 20s → 40s → 80s)
+- After max retries: sends WhatsApp error notification with last error text
+- WhatsApp version auto-update on 405/408 auth failures
 
 ---
 
@@ -139,58 +129,41 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ### WhatsApp
 - Using baileys library for WhatsApp Web connection
 - Messages stored in SQLite, polled by router
-- QR code authentication during setup
+- Pairing code authentication during setup
+- Auto-fetches latest WhatsApp Web version to avoid auth failures
+
+### Voice
+- Whisper-small (ASR): faster-whisper, CPU inference
+- Qwen3-TTS (TTS): natural LLM-based voice, CPU inference
+- Both run in a persistent Docker container via FastAPI
 
 ### Scheduler
 - Built-in scheduler runs on the host, spawns containers for task execution
-- Custom `nanoclaw` MCP server (inside container) provides scheduling tools
-- Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
+- Tools inside container: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
 
 ### Web Access
-- Built-in WebSearch and WebFetch tools
-- Standard Claude Agent SDK capabilities
+- `WebFetch` for static pages (fast, no overhead)
+- `agent-browser` (Playwright/Chromium) for JS-heavy pages, login flows, interactive sites
 
-### Browser Automation
-- agent-browser CLI with Chromium in container
-- Snapshot-based interaction with element references (@e1, @e2, etc.)
-- Screenshots, PDFs, video recording
-- Authentication state persistence
-
----
-
-## Setup & Customization
-
-### Philosophy
-- Minimal configuration files
-- Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
-- Each user gets a custom setup matching their exact needs
-
-### Skills
-- `/setup` - Install dependencies, authenticate WhatsApp, configure scheduler, start services
-- `/customize` - General-purpose skill for adding capabilities (new channels like Telegram, new integrations, behavior changes)
-- `/update` - Pull upstream changes, merge with customizations, run migrations
-
-### Deployment
-- Runs on local Mac via launchd
-- Single Node.js process handles everything
+### Workflow Automation
+- Shell scripts registered in `groups/{name}/workflows/registry.json`
+- Discovered via local semantic embeddings (no API call required)
+- Can be bash, Python, Node — anything executable
+- Future: MCP client integration for Gmail, GitHub, Slack, etc.
 
 ---
 
-## Personal Configuration (Reference)
+## Requirements
 
-These are the creator's settings, stored here for reference:
-
-- **Trigger**: `@Andy` (case insensitive)
-- **Response prefix**: `Andy:`
-- **Persona**: Default Claude (no custom personality)
-- **Main channel**: Self-chat (messaging yourself in WhatsApp)
+- Linux (recommended) or macOS
+- Node.js 22+
+- Docker + Docker Compose
+- Gemini API key (free at [aistudio.google.com](https://aistudio.google.com)) — or OpenRouter/Ollama
 
 ---
 
 ## Project Name
 
-**NanoClaw** - A reference to Clawdbot (now OpenClaw).
+**Stingyclaw** — a pun fork of NanoClaw. Stingy because it runs on free API credits.

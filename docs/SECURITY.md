@@ -1,4 +1,4 @@
-# NanoClaw Security Model
+# Stingyclaw Security Model
 
 ## Trust Model
 
@@ -13,17 +13,17 @@
 
 ### 1. Container Isolation (Primary Boundary)
 
-Agents execute in containers (lightweight Linux VMs), providing:
-- **Process isolation** - Container processes cannot affect the host
-- **Filesystem isolation** - Only explicitly mounted directories are visible
-- **Non-root execution** - Runs as unprivileged `node` user (uid 1000)
-- **Ephemeral containers** - Fresh environment per invocation (`--rm`)
+Agents execute in Docker containers, providing:
+- **Process isolation** — Container processes cannot affect the host
+- **Filesystem isolation** — Only explicitly mounted directories are visible
+- **Non-root execution** — Runs as unprivileged `node` user (uid 1000) when host is not root
+- **Ephemeral containers** — Fresh environment per invocation (`--rm`)
 
 This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what's mounted.
 
 ### 2. Mount Security
 
-**External Allowlist** - Mount permissions stored at `~/.config/nanoclaw/mount-allowlist.json`, which is:
+**External Allowlist** — Mount permissions stored at `~/.config/nanoclaw/mount-allowlist.json`, which is:
 - Outside project root
 - Never mounted into containers
 - Cannot be modified by agents
@@ -42,13 +42,13 @@ private_key, .secret
 
 **Read-Only Project Root:**
 
-The main group's project root is mounted read-only. Writable paths the agent needs (group folder, IPC, `.claude/`) are mounted separately. This prevents the agent from modifying host application code (`src/`, `dist/`, `package.json`, etc.) which would bypass the sandbox entirely on next restart.
+The main group's project root is mounted read-only. Writable paths the agent needs (group folder, IPC, `.stingyclaw/`) are mounted separately. This prevents the agent from modifying host application code (`src/`, `dist/`, `package.json`, etc.) which would bypass the sandbox entirely on next restart.
 
 ### 3. Session Isolation
 
-Each group has isolated Claude sessions at `data/sessions/{group}/.claude/`:
+Each group has isolated sessions at `data/sessions/{group}/.stingyclaw/sessions/`:
 - Groups cannot see other groups' conversation history
-- Session data includes full message history and file contents read
+- Session data includes full message history
 - Prevents cross-group information disclosure
 
 ### 4. IPC Authorization
@@ -66,21 +66,33 @@ Messages and task operations are verified against group identity:
 
 ### 5. Credential Handling
 
-**Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
-
-**NOT Mounted:**
-- WhatsApp session (`store/auth/`) - host only
-- Mount allowlist - external, never mounted
-- Any credentials matching blocked patterns
-
-**Credential Filtering:**
-Only these environment variables are exposed to containers:
+**Secrets passed via stdin only** — never written to disk, never mounted as files:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+container.stdin.write(JSON.stringify({ ...input, secrets: readSecrets() }))
+container.stdin.end()
+delete input.secrets  // removed from memory immediately
 ```
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+**Allowed credentials (read from `.env`, passed via stdin):**
+```
+GEMINI_API_KEY
+OPENROUTER_API_KEY
+MODEL_NAME
+OPENROUTER_BASE_URL
+```
+
+**NOT mounted or passed:**
+- WhatsApp session (`store/auth/`) — host only, never inside containers
+- Mount allowlist — external, never mounted
+- Any credentials matching blocked patterns
+
+The agent can access API keys via `process.env` during its run, but they are not written to any mounted path.
+
+### 6. Workflow Script Security
+
+Workflows are shell scripts in `groups/{name}/workflows/`. They run inside the container (same sandbox as Bash tool calls). The agent can only run scripts that exist in the mounted group folder — it cannot upload or create arbitrary scripts via tool calls unless `Write` access is used (which is intentional and expected for the main group).
+
+For non-main groups with `nonMainReadOnly`, the workflow directory is read-only, preventing agents in those groups from modifying or adding scripts.
 
 ## Privilege Comparison
 
@@ -88,10 +100,10 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 |------------|------------|----------------|
 | Project root access | `/workspace/project` (ro) | None |
 | Group folder | `/workspace/group` (rw) | `/workspace/group` (rw) |
-| Global memory | Implicit via project | `/workspace/global` (ro) |
+| Global memory | Writable | `/workspace/global` (ro) |
 | Additional mounts | Configurable | Read-only unless allowed |
 | Network access | Unrestricted | Unrestricted |
-| MCP tools | All | All |
+| Tools | All | All |
 
 ## Security Architecture Diagram
 
@@ -108,16 +120,24 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 │  • IPC authorization                                              │
 │  • Mount validation (external allowlist)                          │
 │  • Container lifecycle                                            │
-│  • Credential filtering                                           │
+│  • Credential filtering (secrets via stdin only)                  │
+│  • Error notifications                                            │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
-                                 ▼ Explicit mounts only
+                                 ▼ Explicit mounts only, secrets via stdin
 ┌──────────────────────────────────────────────────────────────────┐
 │                CONTAINER (ISOLATED/SANDBOXED)                     │
-│  • Agent execution                                                │
-│  • Bash commands (sandboxed)                                      │
+│  • Agent execution (model-agnostic loop)                          │
+│  • Bash commands (sandboxed, no host access)                      │
 │  • File operations (limited to mounts)                            │
-│  • Network access (unrestricted)                                  │
+│  • Network access (unrestricted — needed for API calls)           │
 │  • Cannot modify security config                                  │
+│  • Cannot access WhatsApp auth                                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+## Known Limitations
+
+- **Network access is unrestricted** inside the container. An agent could make arbitrary outbound connections. Mitigation: container runs as non-root, no host network privileges.
+- **API keys are accessible to the agent** via `process.env` during its run. The agent could theoretically exfiltrate them via network calls. Mitigation: keys have limited scope (model inference only, no billing/admin access).
+- **Prompt injection** via WhatsApp messages is possible in theory. Mitigation: only registered groups are processed, and the main group is private (self-chat).

@@ -1,6 +1,6 @@
-# NanoClaw Specification
+# Stingyclaw Specification
 
-A personal Claude assistant accessible via WhatsApp, with persistent memory per conversation, scheduled tasks, and email integration.
+A personal AI assistant accessible via WhatsApp, with local voice, persistent memory, scheduled tasks, and extensible shell script workflows — zero paid API requirements.
 
 ---
 
@@ -12,11 +12,12 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 4. [Memory System](#memory-system)
 5. [Session Management](#session-management)
 6. [Message Flow](#message-flow)
-7. [Commands](#commands)
-8. [Scheduled Tasks](#scheduled-tasks)
-9. [MCP Servers](#mcp-servers)
-10. [Deployment](#deployment)
-11. [Security Considerations](#security-considerations)
+7. [Tools](#tools)
+8. [Workflows](#workflows)
+9. [Scheduled Tasks](#scheduled-tasks)
+10. [Voice](#voice)
+11. [Deployment](#deployment)
+12. [Security Considerations](#security-considerations)
 
 ---
 
@@ -24,8 +25,8 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        HOST (macOS)                                  │
-│                   (Main Node.js Process)                             │
+│                           HOST (Linux)                               │
+│                      (Main Node.js Process)                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────┐                     ┌────────────────────┐        │
@@ -42,586 +43,362 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 │  └────────┬─────────┘    └────────┬─────────┘    └───────────────┘  │
 │           │                       │                                  │
 │           └───────────┬───────────┘                                  │
-│                       │ spawns container                             │
+│                       │ GroupQueue → spawns container                │
 │                       ▼                                              │
 ├─────────────────────────────────────────────────────────────────────┤
-│                     CONTAINER (Linux VM)                              │
+│              AGENT CONTAINER (Docker, per-group)                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    AGENT RUNNER                               │   │
-│  │                                                                │   │
-│  │  Working directory: /workspace/group (mounted from host)       │   │
-│  │  Volume mounts:                                                │   │
-│  │    • groups/{name}/ → /workspace/group                         │   │
-│  │    • groups/global/ → /workspace/global/ (non-main only)        │   │
-│  │    • data/sessions/{group}/.claude/ → /home/node/.claude/      │   │
-│  │    • Additional dirs → /workspace/extra/*                      │   │
-│  │                                                                │   │
-│  │  Tools (all groups):                                           │   │
-│  │    • Bash (safe - sandboxed in container!)                     │   │
-│  │    • Read, Write, Edit, Glob, Grep (file operations)           │   │
-│  │    • WebSearch, WebFetch (internet access)                     │   │
-│  │    • agent-browser (browser automation)                        │   │
-│  │    • mcp__nanoclaw__* (scheduler tools via IPC)                │   │
-│  │                                                                │   │
+│  │                                                               │   │
+│  │  Model: Gemini API / OpenRouter / Ollama                      │   │
+│  │  Volume mounts:                                               │   │
+│  │    • groups/{name}/  → /workspace/group  (rw)                 │   │
+│  │    • groups/global/  → /workspace/global (ro)                 │   │
+│  │    • data/sessions/  → /home/node/.stingyclaw (rw)            │   │
+│  │    • data/ipc/       → /workspace/ipc    (rw)                 │   │
+│  │    • agent-runner/src → /app/src         (synced on spawn)    │   │
+│  │                                                               │   │
+│  │  Tools: Bash, Read, Write, Edit, Glob, Grep,                  │   │
+│  │         WebFetch, agent-browser,                              │   │
+│  │         send_message, send_voice, ask_boss,                   │   │
+│  │         schedule_task, list_workflows,                        │   │
+│  │         search_tools, run_workflow                            │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
+         │ send_voice IPC
+         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              VOICE SERVICE (Docker, persistent)                      │
+│  FastAPI: /transcribe (Whisper-small) + /synthesize (Qwen3-TTS)     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Technology Stack
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| WhatsApp Connection | Node.js (@whiskeysockets/baileys) | Connect to WhatsApp, send/receive messages |
+| WhatsApp Connection | Node.js (@whiskeysockets/baileys) | Connect to WhatsApp, send/receive |
 | Message Storage | SQLite (better-sqlite3) | Store messages for polling |
-| Container Runtime | Containers (Linux VMs) | Isolated environments for agent execution |
-| Agent | @anthropic-ai/claude-agent-sdk (0.2.29) | Run Claude with tools and MCP servers |
-| Browser Automation | agent-browser + Chromium | Web interaction and screenshots |
-| Runtime | Node.js 20+ | Host process for routing and scheduling |
+| Container Runtime | Docker | Isolated agent execution |
+| Agent Loop | Plain OpenAI-compatible loop (`openai` package) | Model calls + tool execution |
+| Model Backend | Gemini API / OpenRouter / Ollama | LLM inference |
+| Browser Automation | agent-browser + Chromium (Playwright) | Web interaction |
+| Voice ASR | faster-whisper (Whisper-small, CPU) | Voice note transcription |
+| Voice TTS | Qwen3-TTS (CPU) | Natural voice synthesis |
+| Semantic Search | @xenova/transformers (all-MiniLM-L6-v2) | Workflow discovery |
 
 ---
 
 ## Folder Structure
 
 ```
-nanoclaw/
-├── CLAUDE.md                      # Project context for Claude Code
-├── docs/
-│   ├── SPEC.md                    # This specification document
-│   ├── REQUIREMENTS.md            # Architecture decisions
-│   └── SECURITY.md                # Security model
-├── README.md                      # User documentation
-├── package.json                   # Node.js dependencies
-├── tsconfig.json                  # TypeScript configuration
-├── .mcp.json                      # MCP server configuration (reference)
-├── .gitignore
-│
-├── src/
-│   ├── index.ts                   # Orchestrator: state, message loop, agent invocation
-│   ├── channels/
-│   │   └── whatsapp.ts            # WhatsApp connection, auth, send/receive
-│   ├── ipc.ts                     # IPC watcher and task processing
-│   ├── router.ts                  # Message formatting and outbound routing
-│   ├── config.ts                  # Configuration constants
-│   ├── types.ts                   # TypeScript interfaces (includes Channel)
-│   ├── logger.ts                  # Pino logger setup
-│   ├── db.ts                      # SQLite database initialization and queries
-│   ├── group-queue.ts             # Per-group queue with global concurrency limit
-│   ├── mount-security.ts          # Mount allowlist validation for containers
-│   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
-│   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in containers
-│
+stingyclaw/
+├── src/                     # Host process
 ├── container/
-│   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
-│   ├── build.sh                   # Build script for container image
-│   ├── agent-runner/              # Code that runs inside the container
-│   │   ├── package.json
-│   │   ├── tsconfig.json
-│   │   └── src/
-│   │       ├── index.ts           # Entry point (query loop, IPC polling, session resume)
-│   │       └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
-│   └── skills/
-│       └── agent-browser.md       # Browser automation skill
-│
-├── dist/                          # Compiled JavaScript (gitignored)
-│
-├── .claude/
-│   └── skills/
-│       ├── setup/SKILL.md              # /setup - First-time installation
-│       ├── customize/SKILL.md          # /customize - Add capabilities
-│       ├── debug/SKILL.md              # /debug - Container debugging
-│       ├── add-telegram/SKILL.md       # /add-telegram - Telegram channel
-│       ├── add-gmail/SKILL.md          # /add-gmail - Gmail integration
-│       ├── add-voice-transcription/    # /add-voice-transcription - Whisper
-│       ├── x-integration/SKILL.md      # /x-integration - X/Twitter
-│       ├── convert-to-apple-container/  # /convert-to-apple-container - Apple Container runtime
-│       └── add-parallel/SKILL.md       # /add-parallel - Parallel agents
-│
+│   ├── Dockerfile            # Agent image
+│   ├── agent-runner/src/     # Agent loop (synced at runtime)
+│   └── voice-service/        # FastAPI voice server
 ├── groups/
-│   ├── CLAUDE.md                  # Global memory (all groups read this)
-│   ├── main/                      # Self-chat (main control channel)
-│   │   ├── CLAUDE.md              # Main channel memory
-│   │   └── logs/                  # Task execution logs
-│   └── {Group Name}/              # Per-group folders (created on registration)
-│       ├── CLAUDE.md              # Group-specific memory
-│       ├── logs/                  # Task logs for this group
-│       └── *.md                   # Files created by the agent
-│
-├── store/                         # Local data (gitignored)
-│   ├── auth/                      # WhatsApp authentication state
-│   └── messages.db                # SQLite database (messages, chats, scheduled_tasks, task_run_logs, registered_groups, sessions, router_state)
-│
-├── data/                          # Application state (gitignored)
-│   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
-│   ├── env/env                    # Copy of .env for container mounting
-│   └── ipc/                       # Container IPC (messages/, tasks/)
-│
-├── logs/                          # Runtime logs (gitignored)
-│   ├── nanoclaw.log               # Host stdout
-│   └── nanoclaw.error.log         # Host stderr
-│   # Note: Per-container logs are in groups/{folder}/logs/container-*.log
-│
-└── launchd/
-    └── com.nanoclaw.plist         # macOS service configuration
+│   ├── global/MISSION.md     # Shared memory
+│   └── {name}/
+│       ├── MISSION.md        # Group-specific memory
+│       └── workflows/
+│           ├── registry.json
+│           └── *.sh
+├── setup/                   # One-time setup scripts
+├── store/
+│   ├── messages.db           # SQLite
+│   └── auth/                 # WhatsApp session (host-only)
+├── data/
+│   ├── sessions/             # Agent session history
+│   └── ipc/                  # File-based IPC
+├── logs/
+├── docker-compose.yml        # Voice service
+├── MISSION.md                # Project context
+└── .env                      # API keys + config
 ```
 
 ---
 
 ## Configuration
 
-Configuration constants are in `src/config.ts`:
-
-```typescript
-import path from 'path';
-
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
-export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
-
-// Paths are absolute (required for container mounts)
-const PROJECT_ROOT = process.cwd();
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
-export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
-
-// Container configuration
-export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10); // 30min default
-export const IPC_POLL_INTERVAL = 1000;
-export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min — keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
-
-export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
-```
-
-**Note:** Paths must be absolute for container volume mounts to work correctly.
-
-### Container Configuration
-
-Groups can have additional directories mounted via `containerConfig` in the SQLite `registered_groups` table (stored as JSON in the `container_config` column). Example registration:
-
-```typescript
-registerGroup("1234567890@g.us", {
-  name: "Dev Team",
-  folder: "dev-team",
-  trigger: "@Andy",
-  added_at: new Date().toISOString(),
-  containerConfig: {
-    additionalMounts: [
-      {
-        hostPath: "~/projects/webapp",
-        containerPath: "webapp",
-        readonly: false,
-      },
-    ],
-    timeout: 600000,
-  },
-});
-```
-
-Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
-
-**Mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix may not work on all runtimes).
-
-### Claude Authentication
-
-Configure authentication in a `.env` file in the project root. Two options:
-
-**Option 1: Claude Subscription (OAuth token)**
-```bash
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-```
-The token can be extracted from `~/.claude/.credentials.json` if you're logged in to Claude Code.
-
-**Option 2: Pay-per-use API Key**
-```bash
-ANTHROPIC_API_KEY=sk-ant-api03-...
-```
-
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
-
-### Changing the Assistant Name
-
-Set the `ASSISTANT_NAME` environment variable:
+`.env` file:
 
 ```bash
-ASSISTANT_NAME=Bot npm start
+# Model backend (first set wins)
+GEMINI_API_KEY=AIza...              # Gemini direct (free, recommended)
+# OPENROUTER_API_KEY=sk-or-v1-...  # OpenRouter alternative
+# OPENROUTER_API_KEY=ollama        # Local Ollama
+
+MODEL_NAME=gemini-2.5-flash         # Must match backend
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+
+ASSISTANT_NAME=Clawman              # Trigger: @Clawman
+TZ=Europe/Brussels                  # Timezone for container
 ```
 
-Or edit the default in `src/config.ts`. This changes:
-- The trigger pattern (messages must start with `@YourName`)
-- The response prefix (`YourName:` added automatically)
-
-### Placeholder Values in launchd
-
-Files with `{{PLACEHOLDER}}` values need to be configured:
-- `{{PROJECT_ROOT}}` - Absolute path to your nanoclaw installation
-- `{{NODE_PATH}}` - Path to node binary (detected via `which node`)
-- `{{HOME}}` - User's home directory
+**Model name rules:**
+- For Gemini: use `gemini-2.5-flash`, `gemini-2.5-pro`, etc.
+- For OpenRouter: use slugs like `meta-llama/llama-3.3-70b-instruct:free`
+- For Ollama: use model names like `llama3.2`
+- If you set a Gemini key but leave an OpenRouter-style slug in `MODEL_NAME`, the agent auto-falls back to `gemini-2.5-flash`
 
 ---
 
 ## Memory System
 
-NanoClaw uses a hierarchical memory system based on CLAUDE.md files.
+### MISSION.md (Per-Group Memory)
 
-### Memory Hierarchy
+Each group has a `groups/{name}/MISSION.md` injected into every system prompt. This is the agent's persona and standing instructions for that group.
 
-| Level | Location | Read By | Written By | Purpose |
-|-------|----------|---------|------------|---------|
-| **Global** | `groups/CLAUDE.md` | All groups | Main only | Preferences, facts, context shared across all conversations |
-| **Group** | `groups/{name}/CLAUDE.md` | That group | That group | Group-specific context, conversation memory |
-| **Files** | `groups/{name}/*.md` | That group | That group | Notes, research, documents created during conversation |
+```
+groups/
+  global/MISSION.md    ← read by ALL groups; writable only from main
+  main/MISSION.md      ← main group persona
+  {name}/MISSION.md    ← group-specific persona
+```
 
-### How Memory Works
+Keep MISSION.md short — it's sent on every request. For large reference data, let the agent `Read` files on demand.
 
-1. **Agent Context Loading**
-   - Agent runs with `cwd` set to `groups/{group-name}/`
-   - Claude Agent SDK with `settingSources: ['project']` automatically loads:
-     - `../CLAUDE.md` (parent directory = global memory)
-     - `./CLAUDE.md` (current directory = group memory)
+### Files
 
-2. **Writing Memory**
-   - When user says "remember this", agent writes to `./CLAUDE.md`
-   - When user says "remember this globally" (main channel only), agent writes to `../CLAUDE.md`
-   - Agent can create files like `notes.md`, `research.md` in the group folder
-
-3. **Main Channel Privileges**
-   - Only the "main" group (self-chat) can write to global memory
-   - Main can manage registered groups and schedule tasks for any group
-   - Main can configure additional directory mounts for any group
-   - All groups have Bash access (safe because it runs inside container)
+The agent's working directory inside the container is `/workspace/group`, which maps to `groups/{name}/` on the host. The agent can create and read files here freely. These files persist across sessions.
 
 ---
 
 ## Session Management
 
-Sessions enable conversation continuity - Claude remembers what you talked about.
+Sessions are stored as JSON at `data/sessions/{group}/.stingyclaw/sessions/{uuid}.json`:
 
-### How Sessions Work
+```json
+{
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "...", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "...", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
 
-1. Each group has a session ID stored in SQLite (`sessions` table, keyed by `group_folder`)
-2. Session ID is passed to Claude Agent SDK's `resume` option
-3. Claude continues the conversation with full context
-4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
+Sessions are resumed on every new message to the group. They accumulate indefinitely.
+
+**Gemini compatibility:** Before each API call, messages are sanitized — empty `content` and OpenAI-specific null fields are stripped. On 400 errors, the session is auto-trimmed to the last 10 messages.
 
 ---
 
 ## Message Flow
 
-### Incoming Message Flow
-
 ```
-1. User sends WhatsApp message
-   │
-   ▼
-2. Baileys receives message via WhatsApp Web protocol
-   │
-   ▼
-3. Message stored in SQLite (store/messages.db)
-   │
-   ▼
-4. Message loop polls SQLite (every 2 seconds)
-   │
-   ▼
-5. Router checks:
-   ├── Is chat_jid in registered groups (SQLite)? → No: ignore
-   └── Does message match trigger pattern? → No: store but don't process
-   │
-   ▼
-6. Router catches up conversation:
-   ├── Fetch all messages since last agent interaction
-   ├── Format with timestamp and sender name
-   └── Build prompt with full conversation context
-   │
-   ▼
-7. Router invokes Claude Agent SDK:
-   ├── cwd: groups/{group-name}/
-   ├── prompt: conversation history + current message
-   ├── resume: session_id (for continuity)
-   └── mcpServers: nanoclaw (scheduler)
-   │
-   ▼
-8. Claude processes message:
-   ├── Reads CLAUDE.md files for context
-   └── Uses tools as needed (search, email, etc.)
-   │
-   ▼
-9. Router prefixes response with assistant name and sends via WhatsApp
-   │
-   ▼
-10. Router updates last agent timestamp and saves session ID
+1. User sends WhatsApp message (text or voice note)
+2. Baileys receives it → stores in SQLite
+3. Host polling loop detects new message
+4. [If voice] → POST /transcribe to voice service → get transcript
+5. GroupQueue: is a container already running for this group?
+   └── Yes → send via IPC input file (agent receives mid-session)
+   └── No  → spawn new container
+6. Container starts → TypeScript compiled → session loaded
+7. Agent loop runs until model says stop or MAX_TURNS reached
+8. Agent sends reply via send_message or send_voice IPC
+9. Container exits → session saved → host picks up next message
 ```
 
-### Trigger Word Matching
-
-Messages must start with the trigger pattern (default: `@Andy`):
-- `@Andy what's the weather?` → ✅ Triggers Claude
-- `@andy help me` → ✅ Triggers (case insensitive)
-- `Hey @Andy` → ❌ Ignored (trigger not at start)
-- `What's up?` → ❌ Ignored (no trigger)
-
-### Conversation Catch-Up
-
-When a triggered message arrives, the agent receives all messages since its last interaction in that chat. Each message is formatted with timestamp and sender name:
-
-```
-[Jan 31 2:32 PM] John: hey everyone, should we do pizza tonight?
-[Jan 31 2:33 PM] Sarah: sounds good to me
-[Jan 31 2:35 PM] John: @Andy what toppings do you recommend?
-```
-
-This allows the agent to understand the conversation context even if it wasn't mentioned in every message.
+**Error path:**
+- Container fails (non-zero exit) → GroupQueue schedules retry with backoff
+- After 5 retries → WhatsApp error notification sent to user → cursor reset
 
 ---
 
-## Commands
+## Tools
 
-### Commands Available in Any Group
+### Always Available (Built-In)
 
-| Command | Example | Effect |
-|---------|---------|--------|
-| `@Assistant [message]` | `@Andy what's the weather?` | Talk to Claude |
+| Tool | Description |
+|------|-------------|
+| `Bash` | Run shell commands in container sandbox |
+| `Read` | Read file contents |
+| `Write` | Write file (create or overwrite) |
+| `Edit` | Replace string in file |
+| `Grep` | Search file contents (ripgrep) |
+| `Glob` | Find files by pattern |
+| `WebFetch` | Fetch URL, convert HTML to markdown |
+| `agent-browser` | Headless Chromium via CLI (JS pages, click, fill, screenshot) |
+| `send_message` | Send WhatsApp text message |
+| `send_voice` | Synthesize + send WhatsApp voice note |
+| `ask_boss` | Send message to user and wait for their reply |
+| `schedule_task` | Create/modify scheduled agent tasks |
+| `list_workflows` | List all registered automations |
+| `search_tools` | Semantic search over workflow registry |
+| `run_workflow` | Execute a workflow by name |
 
-### Commands Available in Main Channel Only
+### agent-browser Usage
 
-| Command | Example | Effect |
-|---------|---------|--------|
-| `@Assistant add group "Name"` | `@Andy add group "Family Chat"` | Register a new group |
-| `@Assistant remove group "Name"` | `@Andy remove group "Work Team"` | Unregister a group |
-| `@Assistant list groups` | `@Andy list groups` | Show registered groups |
-| `@Assistant remember [fact]` | `@Andy remember I prefer dark mode` | Add to global memory |
+```bash
+# Inside Bash tool:
+agent-browser open https://example.com
+agent-browser snapshot -i                    # get accessibility tree with refs
+agent-browser click @e5
+agent-browser fill @e3 "search query"
+agent-browser screenshot page.png
+```
+
+Use `WebFetch` for simple/static pages. Use `agent-browser` for:
+- JavaScript-rendered pages
+- Login flows
+- Form submission
+- Sites that block non-browser requests
+
+---
+
+## Workflows
+
+Pre-built automations the agent discovers and runs via semantic search.
+
+### Registry Format
+
+`groups/{name}/workflows/registry.json`:
+```json
+[
+  {
+    "name": "morning-briefing",
+    "description": "Daily weather and news summary. Also: morning report, daily briefing.",
+    "run": "bash morning-briefing.sh"
+  },
+  {
+    "name": "notify-slack",
+    "description": "Send a message to a Slack channel",
+    "run": "bash notify-slack.sh",
+    "args": ["message", "channel"]
+  }
+]
+```
+
+### Decision Flow
+
+```
+User: "morning briefing"
+  → search_tools("morning briefing")   [semantic, local embeddings]
+  → match found: morning-briefing
+  → run_workflow("morning-briefing")
+  → bash morning-briefing.sh
+  → reply
+
+User: "what's the capital of France?"
+  → search_tools("capital of France")  [no match above threshold]
+  → model answers directly
+```
+
+### Script Execution
+
+Scripts run inside the container:
+- Working directory: `/workspace/group/workflows/`
+- Args passed as uppercase env vars: `run_workflow("notify-slack", {message: "hello", channel: "#general"})` → `$MESSAGE=hello $CHANNEL=#general bash notify-slack.sh`
+- stdout is returned to the model as the tool result
+- Timeout: 120 seconds
+
+Scripts can be bash, Python, Node — anything available in the container.
+
+### Embedding
+
+Workflows are embedded locally using `all-MiniLM-L6-v2` (quantized, ~23MB, baked into image). Results are cached in `.embeddings-cache.json`. No API call required.
 
 ---
 
 ## Scheduled Tasks
 
-NanoClaw has a built-in scheduler that runs tasks as full agents in their group's context.
+Users can ask the agent to schedule tasks:
 
-### How Scheduling Works
-
-1. **Group Context**: Tasks created in a group run with that group's working directory and memory
-2. **Full Agent Capabilities**: Scheduled tasks have access to all tools (WebSearch, file operations, etc.)
-3. **Optional Messaging**: Tasks can send messages to their group using the `send_message` tool, or complete silently
-4. **Main Channel Privileges**: The main channel can schedule tasks for any group and view all tasks
+> "Remind me every morning at 9am with a news briefing"
+> "Check the server status every hour and message me if disk is above 80%"
 
 ### Schedule Types
 
-| Type | Value Format | Example |
-|------|--------------|---------|
-| `cron` | Cron expression | `0 9 * * 1` (Mondays at 9am) |
-| `interval` | Milliseconds | `3600000` (every hour) |
-| `once` | ISO timestamp | `2024-12-25T09:00:00Z` |
+| Type | Format | Example |
+|------|--------|---------|
+| Cron | Standard cron string | `"0 9 * * *"` (daily 9am) |
+| Interval | Milliseconds | `3600000` (every hour) |
+| One-time | ISO timestamp | `"2026-03-15T10:00:00Z"` |
 
-### Creating a Task
+### Execution
 
-```
-User: @Andy remind me every Monday at 9am to review the weekly metrics
+Tasks spawn a full agent container in the group's context. The agent runs the task prompt and can use all tools including `send_message` to report results back.
 
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Send a reminder to review weekly metrics. Be encouraging!",
-          "schedule_type": "cron",
-          "schedule_value": "0 9 * * 1"
-        }
-
-Claude: Done! I'll remind you every Monday at 9am.
-```
-
-### One-Time Tasks
-
-```
-User: @Andy at 5pm today, send me a summary of today's emails
-
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Search for today's emails, summarize the important ones, and send the summary to the group.",
-          "schedule_type": "once",
-          "schedule_value": "2024-01-31T17:00:00Z"
-        }
-```
-
-### Managing Tasks
-
-From any group:
-- `@Andy list my scheduled tasks` - View tasks for this group
-- `@Andy pause task [id]` - Pause a task
-- `@Andy resume task [id]` - Resume a paused task
-- `@Andy cancel task [id]` - Delete a task
-
-From main channel:
-- `@Andy list all tasks` - View tasks from all groups
-- `@Andy schedule task for "Family Chat": [prompt]` - Schedule for another group
+### Privileges
+- Main group: can schedule tasks for any group, view/manage all
+- Other groups: own tasks only
 
 ---
 
-## MCP Servers
+## Voice
 
-### NanoClaw MCP (built-in)
+### Input (ASR)
 
-The `nanoclaw` MCP server is created dynamically per agent call with the current group's context.
+Voice notes are transcribed locally by Whisper-small (CPU) via the voice service. The transcript is prepended with `[Voice: ...]` in the message:
 
-**Available Tools:**
-| Tool | Purpose |
-|------|---------|
-| `schedule_task` | Schedule a recurring or one-time task |
-| `list_tasks` | Show tasks (group's tasks, or all if main) |
-| `get_task` | Get task details and run history |
-| `update_task` | Modify task prompt or schedule |
-| `pause_task` | Pause a task |
-| `resume_task` | Resume a paused task |
-| `cancel_task` | Delete a task |
-| `send_message` | Send a WhatsApp message to the group |
+```
+[Voice: Hey, what's the weather today?]
+```
+
+The agent is instructed to reply with `send_voice` when the user sent a voice note.
+
+### Output (TTS)
+
+`send_voice` → POST `/synthesize` to voice service → Qwen3-TTS generates audio → OGG file → WhatsApp PTT (push-to-talk) voice note.
+
+First synthesis is slow (~30-60s on CPU) because the model downloads on first use. Subsequent calls are faster.
 
 ---
 
 ## Deployment
 
-NanoClaw runs as a single macOS launchd service.
-
-### Startup Sequence
-
-When NanoClaw starts, it:
-1. **Ensures container runtime is running** - Automatically starts it if needed; kills orphaned NanoClaw containers from previous runs
-2. Initializes the SQLite database (migrates from JSON files if they exist)
-3. Loads state from SQLite (registered groups, sessions, router state)
-4. Connects to WhatsApp (on `connection.open`):
-   - Starts the scheduler loop
-   - Starts the IPC watcher for container messages
-   - Sets up the per-group queue with `processGroupMessages`
-   - Recovers any unprocessed messages from before shutdown
-   - Starts the message polling loop
-
-### Service: com.nanoclaw
-
-**launchd/com.nanoclaw.plist:**
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.nanoclaw</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{{NODE_PATH}}</string>
-        <string>{{PROJECT_ROOT}}/dist/index.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{{PROJECT_ROOT}}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>{{HOME}}</string>
-        <key>ASSISTANT_NAME</key>
-        <string>Andy</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.log</string>
-    <key>StandardErrorPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.error.log</string>
-</dict>
-</plist>
-```
-
-### Managing the Service
+### Setup
 
 ```bash
-# Install service
-cp launchd/com.nanoclaw.plist ~/Library/LaunchAgents/
+git clone https://github.com/kazGuido/stingyclaw.git
+cd stingyclaw
+cp .env.example .env
+# Edit .env — set GEMINI_API_KEY (or OPENROUTER_API_KEY)
 
-# Start service
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
+bash setup.sh                          # check deps
+npx tsx setup/index.ts --step container -- --runtime docker   # build agent image
+docker compose up -d voice             # start voice service
+npx tsx setup/index.ts --step whatsapp-auth -- --method pairing-code --phone +XXXXXXXXXXX
+```
 
-# Stop service
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
+### Running
 
-# Check status
-launchctl list | grep nanoclaw
+```bash
+npm run build
+node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+```
 
-# View logs
-tail -f logs/nanoclaw.log
+### Updating Agent Code
+
+The agent-runner source (`container/agent-runner/src/`) is synced to the container on every spawn — no image rebuild needed for agent logic changes. Just restart the host process.
+
+For Dockerfile changes (new packages, system deps):
+```bash
+docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+```
+
+For voice service changes:
+```bash
+docker compose build --no-cache voice
+docker compose up -d voice
 ```
 
 ---
 
 ## Security Considerations
 
-### Container Isolation
+See [SECURITY.md](SECURITY.md) for the full security model.
 
-All agents run inside containers (lightweight Linux VMs), providing:
-- **Filesystem isolation**: Agents can only access mounted directories
-- **Safe Bash access**: Commands run inside the container, not on your Mac
-- **Network isolation**: Can be configured per-container if needed
-- **Process isolation**: Container processes can't affect the host
-- **Non-root user**: Container runs as unprivileged `node` user (uid 1000)
-
-### Prompt Injection Risk
-
-WhatsApp messages could contain malicious instructions attempting to manipulate Claude's behavior.
-
-**Mitigations:**
-- Container isolation limits blast radius
-- Only registered groups are processed
-- Trigger word required (reduces accidental processing)
-- Agents can only access their group's mounted directories
-- Main can configure additional directories per group
-- Claude's built-in safety training
-
-**Recommendations:**
-- Only register trusted groups
-- Review additional directory mounts carefully
-- Review scheduled tasks periodically
-- Monitor logs for unusual activity
-
-### Credential Storage
-
-| Credential | Storage Location | Notes |
-|------------|------------------|-------|
-| Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
-| WhatsApp Session | store/auth/ | Auto-created, persists ~20 days |
-
-### File Permissions
-
-The groups/ folder contains personal memory and should be protected:
-```bash
-chmod 700 groups/
-```
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
-| "Claude Code process exited with code 1" | Container runtime failed to start | Check logs; NanoClaw auto-starts container runtime but may fail |
-| "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
-| Session not continuing | Session ID not saved | Check SQLite: `sqlite3 store/messages.db "SELECT * FROM sessions"` |
-| Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
-| "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
-| "No groups registered" | Haven't added groups | Use `@Andy add group "Name"` in main |
-
-### Log Location
-
-- `logs/nanoclaw.log` - stdout
-- `logs/nanoclaw.error.log` - stderr
-
-### Debug Mode
-
-Run manually for verbose output:
-```bash
-npm run dev
-# or
-node dist/index.js
-```
+**Key points:**
+- Agents run in Docker containers — no access to host filesystem except explicit mounts
+- API keys passed via stdin only — never written to disk or mounted as files
+- WhatsApp auth (`store/auth/`) is never mounted into containers
+- Mount allowlist stored outside project root — agents cannot modify it
+- Main group is admin; non-main groups have restricted capabilities
+- On agent errors: exponential retry backoff, then WhatsApp error notification

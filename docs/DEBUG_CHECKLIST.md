@@ -1,143 +1,186 @@
-# NanoClaw Debug Checklist
-
-## Known Issues (2026-02-08)
-
-### 1. [FIXED] Resume branches from stale tree position
-When agent teams spawns subagent CLI processes, they write to the same session JSONL. On subsequent `query()` resumes, the CLI reads the JSONL but may pick a stale branch tip (from before the subagent activity), causing the agent's response to land on a branch the host never receives a `result` for. **Fix**: pass `resumeSessionAt` with the last assistant message UUID to explicitly anchor each resume.
-
-### 2. IDLE_TIMEOUT == CONTAINER_TIMEOUT (both 30 min)
-Both timers fire at the same time, so containers always exit via hard SIGKILL (code 137) instead of graceful `_close` sentinel shutdown. The idle timeout should be shorter (e.g., 5 min) so containers wind down between messages, while container timeout stays at 30 min as a safety net for stuck agents.
-
-### 3. Cursor advanced before agent succeeds
-`processGroupMessages` advances `lastAgentTimestamp` before the agent runs. If the container times out, retries find no messages (cursor already past them). Messages are permanently lost on timeout.
+# Stingyclaw Debug Checklist
 
 ## Quick Status Check
 
 ```bash
-# 1. Is the service running?
-launchctl list | grep nanoclaw
-# Expected: PID  0  com.nanoclaw (PID = running, "-" = not running, non-zero exit = crashed)
+# 1. Is the host process running?
+pgrep -a -f 'nanoclaw/dist/index.js'
 
-# 2. Any running containers?
-container ls --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
+# 2. Any running agent containers?
+docker ps --format '{{.Names}} {{.Status}}' | grep nanoclaw
 
-# 3. Any stopped/orphaned containers?
-container ls -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
+# 3. Is the voice service running?
+docker ps --format '{{.Names}} {{.Status}}' | grep stingyclaw-voice
 
-# 4. Recent errors in service log?
-grep -E 'ERROR|WARN' logs/nanoclaw.log | tail -20
+# 4. Recent errors?
+grep -E 'ERROR|WARN|Fatal' logs/nanoclaw.log | tail -20
 
-# 5. Is WhatsApp connected? (look for last connection event)
-grep -E 'Connected to WhatsApp|Connection closed|connection.*close' logs/nanoclaw.log | tail -5
+# 5. Is WhatsApp connected?
+grep -E 'Connected|Connection closed|Connecting' logs/nanoclaw.log | tail -5
 
 # 6. Are groups loaded?
-grep 'groupCount' logs/nanoclaw.log | tail -3
+grep 'Group registered' logs/nanoclaw.log | tail -5
 ```
 
-## Session Transcript Branching
-
-```bash
-# Check for concurrent CLI processes in session debug logs
-ls -la data/sessions/<group>/.claude/debug/
-
-# Count unique SDK processes that handled messages
-# Each .txt file = one CLI subprocess. Multiple = concurrent queries.
-
-# Check parentUuid branching in transcript
-python3 -c "
-import json, sys
-lines = open('data/sessions/<group>/.claude/projects/-workspace-group/<session>.jsonl').read().strip().split('\n')
-for i, line in enumerate(lines):
-  try:
-    d = json.loads(line)
-    if d.get('type') == 'user' and d.get('message'):
-      parent = d.get('parentUuid', 'ROOT')[:8]
-      content = str(d['message'].get('content', ''))[:60]
-      print(f'L{i+1} parent={parent} {content}')
-  except: pass
-"
-```
-
-## Container Timeout Investigation
-
-```bash
-# Check for recent timeouts
-grep -E 'Container timeout|timed out' logs/nanoclaw.log | tail -10
-
-# Check container log files for the timed-out container
-ls -lt groups/*/logs/container-*.log | head -10
-
-# Read the most recent container log (replace path)
-cat groups/<group>/logs/container-<timestamp>.log
-
-# Check if retries were scheduled and what happened
-grep -E 'Scheduling retry|retry|Max retries' logs/nanoclaw.log | tail -10
-```
+---
 
 ## Agent Not Responding
 
 ```bash
-# Check if messages are being received from WhatsApp
-grep 'New messages' logs/nanoclaw.log | tail -10
+# Check if messages are being received
+grep 'New messages\|Processing messages' logs/nanoclaw.log | tail -10
 
-# Check if messages are being processed (container spawned)
-grep -E 'Processing messages|Spawning container' logs/nanoclaw.log | tail -10
+# Check if container was spawned
+grep 'Spawning container' logs/nanoclaw.log | tail -5
 
-# Check if messages are being piped to active container
-grep -E 'Piped messages|sendMessage' logs/nanoclaw.log | tail -10
+# Check if agent errored and retries are happening
+grep -E 'Container agent error|Scheduling retry|Max retries exceeded' logs/nanoclaw.log | tail -10
 
-# Check the queue state — any active containers?
-grep -E 'Starting container|Container active|concurrency limit' logs/nanoclaw.log | tail -10
+# Check the most recent container log
+ls -lt groups/main/logs/container-*.log | head -3
+cat groups/main/logs/container-$(ls -t groups/main/logs/ | head -1 | sed 's/container-//')
 
-# Check lastAgentTimestamp vs latest message timestamp
+# Manually trigger by checking message cursor vs DB
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"
 ```
 
-## Container Mount Issues
+---
+
+## Container Failures
 
 ```bash
-# Check mount validation logs (shows on container spawn)
-grep -E 'Mount validated|Mount.*REJECTED|mount' logs/nanoclaw.log | tail -10
+# Check recent container start/die events
+docker events --since 10m --filter event=die --filter event=start \
+  --format "{{.Time}} {{.Actor.Attributes.name}} {{.Action}}" 2>/dev/null
 
-# Verify the mount allowlist is readable
-cat ~/.config/nanoclaw/mount-allowlist.json
+# Get logs from a specific container (it exits fast — catch it)
+docker ps -a --format '{{.Names}} {{.Status}}' | grep nanoclaw
 
-# Check group's container_config in DB
-sqlite3 store/messages.db "SELECT name, container_config FROM registered_groups;"
+# Test run the agent image manually with dummy input
+echo '{"group":"main","message":"test","history":[]}' | docker run --rm -i \
+  -e GEMINI_API_KEY=test \
+  nanoclaw-agent:latest 2>&1 | head -20
 
-# Test-run a container to check mounts (dry run)
-# Replace <group-folder> with the group's folder name
-container run -i --rm --entrypoint ls nanoclaw-agent:latest /workspace/extra/
+# Check image build date vs last code change
+docker inspect nanoclaw-agent:latest --format '{{.Created}}'
+ls -la container/agent-runner/src/index.ts
 ```
+
+---
+
+## Voice Service Issues
+
+```bash
+# Check voice container logs
+docker logs stingyclaw-voice --tail 30
+
+# Test transcription endpoint
+curl -s http://localhost:8001/health
+
+# Test synthesis (sends back audio bytes)
+curl -s -X POST http://localhost:8001/synthesize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hello world"}' | wc -c
+# Expected: non-zero byte count
+
+# Rebuild and restart voice if broken
+docker compose build --no-cache voice
+docker compose up -d voice
+docker logs stingyclaw-voice --tail 20
+```
+
+---
+
+## Gemini API / Model Issues
+
+```bash
+# Test Gemini API key directly
+GEMINI_KEY=$(grep GEMINI_API_KEY .env | cut -d= -f2)
+curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" \
+  -H "Authorization: Bearer $GEMINI_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"ping"}]}' | python3 -m json.tool
+
+# Check what model and backend the agent is using
+grep 'Backend:' logs/nanoclaw.log | tail -5
+
+# Corrupt session causing 400? Reset it:
+SESSION_FILE=$(find data/sessions -name "*.json" | head -1)
+echo $SESSION_FILE
+python3 -c "import json; s=json.load(open('$SESSION_FILE')); s['messages']=[]; json.dump(s,open('$SESSION_FILE','w'))"
+```
+
+---
+
+## Session Issues
+
+```bash
+# Find session files for main group
+ls data/sessions/main/.stingyclaw/sessions/
+
+# Check session message count
+python3 -c "
+import json, glob
+for f in glob.glob('data/sessions/main/.stingyclaw/sessions/*.json'):
+    s = json.load(open(f))
+    print(len(s.get('messages',[])), f.split('/')[-1])
+"
+
+# Reset a session (backup first)
+SESSION="data/sessions/main/.stingyclaw/sessions/<session-id>.json"
+cp "$SESSION" "${SESSION}.bak"
+python3 -c "import json; s=json.load(open('$SESSION')); s['messages']=[]; json.dump(s,open('$SESSION','w'))"
+```
+
+---
 
 ## WhatsApp Auth Issues
 
 ```bash
-# Check if QR code was requested (means auth expired)
-grep 'QR\|authentication required\|qr' logs/nanoclaw.log | tail -5
+# Check if auth expired (QR requested)
+grep -E 'QR|authentication|pairing' logs/nanoclaw.log | tail -5
 
 # Check auth files exist
 ls -la store/auth/
 
-# Re-authenticate if needed
-npm run auth
+# Re-authenticate
+npx tsx setup/index.ts --step whatsapp-auth -- --method pairing-code --phone +XXXXXXXXXXX
 ```
+
+---
 
 ## Service Management
 
 ```bash
-# Restart the service
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+# Restart the host process
+HOST_PID=$(pgrep -f 'nanoclaw/dist/index.js')
+kill $HOST_PID
+sleep 2
+nohup node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+
+# Rebuild after code changes and restart
+npm run build
+kill $(pgrep -f 'nanoclaw/dist/index.js')
+nohup node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+
+# Rebuild agent container image
+docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+# (the agent-runner/src is mounted at runtime — just restart host for code changes there)
 
 # View live logs
 tail -f logs/nanoclaw.log
-
-# Stop the service (careful — running containers are detached, not killed)
-launchctl bootout gui/$(id -u)/com.nanoclaw
-
-# Start the service
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nanoclaw.plist
-
-# Rebuild after code changes
-npm run build && launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+tail -f logs/nanoclaw.error.log
 ```
+
+---
+
+## Known Issues & Fixes
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| `400 status code (no body)` from Gemini | Session has OpenAI-specific fields (`refusal: null`) or bad turn ordering | Reset session messages to `[]` |
+| `MODEL_NAME` not working | OpenRouter slug sent to Gemini endpoint | Agent auto-detects and falls back to `gemini-2.5-flash` |
+| Max retries exceeded, you get WhatsApp error notification | API key wrong, model unavailable, or corrupt session | Check API key, reset session |
+| Voice container crashed on first synthesis | Qwen3-TTS model downloading (lazy load) | Wait 2-3 min for first synthesis, check `docker logs stingyclaw-voice` |
+| `container: command not found` in agent | Apple Container not installed (only relevant for macOS users) | Use Docker — the project uses `docker` by default |
+| Agent container rebuilds too slow | `--no-cache` rebuilds everything | Without `--no-cache`, cached layers are reused; source is mounted at runtime anyway |

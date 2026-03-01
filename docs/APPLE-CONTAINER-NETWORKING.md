@@ -1,4 +1,6 @@
-# Apple Container Networking Setup (macOS 26)
+# Apple Container Networking Setup (macOS)
+
+> **Note:** Stingyclaw uses Docker by default and works out of the box on Linux and macOS with Docker Desktop. This document is only relevant if you're running on macOS with Apple's native container runtime (`container` CLI) instead of Docker.
 
 Apple Container's vmnet networking requires manual configuration for containers to access the internet. Without this, containers can communicate with the host but cannot reach external services (DNS, HTTPS, APIs).
 
@@ -51,9 +53,9 @@ sysctl net.inet.ip.forwarding
 # Expected: net.inet.ip.forwarding: 1
 
 # Test container internet access
-container run --rm --entrypoint curl nanoclaw-agent:latest \
-  -s4 --connect-timeout 5 -o /dev/null -w "%{http_code}" https://api.anthropic.com
-# Expected: 404
+docker run --rm curlimages/curl \
+  -s4 --connect-timeout 5 -o /dev/null -w "%{http_code}" https://generativelanguage.googleapis.com
+# Expected: 200 or 403 (not a timeout)
 
 # Check bridge interface (only exists when a container is running)
 ifconfig bridge100

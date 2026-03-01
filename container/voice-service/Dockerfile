@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# CPU-only PyTorch to keep image smaller (omit for GPU hosts)
+# CPU-only PyTorch + torchaudio from the same index (must match to avoid .so incompatibility)
 ARG TORCH_INDEX="https://download.pytorch.org/whl/cpu"
-RUN pip install --no-cache-dir torch --index-url "${TORCH_INDEX}" || \
-    pip install --no-cache-dir torch
+RUN pip install --no-cache-dir torch torchaudio --index-url "${TORCH_INDEX}" || \
+    pip install --no-cache-dir torch torchaudio
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt requests
