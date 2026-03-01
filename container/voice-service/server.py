@@ -1,110 +1,70 @@
 """
-Voice service for Stingyclaw — powered by LFM2.5-Audio-1.5B (GGUF, CPU).
+Voice service — LFM2.5-Audio-1.5B
+  ASR:  POST /transcribe  — audio upload → {"text": "..."}
+  TTS:  POST /synthesize  — {"text":"..."} → OGG audio
+  GET   /health
 
-One model handles both:
-  ASR:  POST /transcribe  — audio bytes → {"text": "..."}
-  TTS:  POST /synthesize  — {"text": "..."} → OGG audio bytes
-  GET   /health           — liveness check
-
-Model: LiquidAI/LFM2.5-Audio-1.5B
-  - GGUF backbone (llama-cpp-python) for CPU-efficient LM inference
-  - FastConformer audio encoder + Mimi detokenizer for audio I/O
-  - Single model, no separate Whisper or TTS component needed
+Model loaded once at startup, weights cached in /models via HuggingFace hub.
+API follows exactly: https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B
 """
 
 import io
 import os
-import subprocess
 import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
 
-import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-HF_REPO = os.environ.get("LFM_REPO", "LiquidAI/LFM2.5-Audio-1.5B")
+HF_REPO = "LiquidAI/LFM2.5-Audio-1.5B"
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/models"))
-# Use GGUF quantized model for CPU — Q4_K_M is a good balance of size/quality
-# Override with LFM_GGUF_FILE env var if you want a different quant
-GGUF_FILE = os.environ.get("LFM_GGUF_FILE", None)  # None = auto-detect
+os.environ.setdefault("HF_HOME", str(MODELS_DIR / "hf-cache"))
 
-# ── App ────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Stingyclaw Voice Service (LFM2.5-Audio)")
+app = FastAPI(title="Stingyclaw Voice — LFM2.5-Audio")
 
 _model = None
 _processor = None
-_model_lock = threading.Lock()
+_lock = threading.Lock()
 
 
 def get_model():
     global _model, _processor
     if _model is None:
-        with _model_lock:
+        with _lock:
             if _model is None:
                 from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
-
-                print(f"[voice] Loading LFM2.5-Audio from {HF_REPO}...", flush=True)
-                cache_dir = str(MODELS_DIR / "lfm2-audio")
-
-                _processor = LFM2AudioProcessor.from_pretrained(
-                    HF_REPO,
-                    cache_dir=cache_dir,
-                ).eval()
-
-                load_kwargs: dict = {
-                    "cache_dir": cache_dir,
-                }
-                # Load GGUF if specified or auto-detected
-                if GGUF_FILE:
-                    load_kwargs["gguf_file"] = GGUF_FILE
-                    print(f"[voice] Using GGUF: {GGUF_FILE}", flush=True)
-
-                _model = LFM2AudioModel.from_pretrained(
-                    HF_REPO,
-                    **load_kwargs,
-                ).eval()
-
-                print("[voice] LFM2.5-Audio ready.", flush=True)
+                print(f"[voice] Loading {HF_REPO}...", flush=True)
+                _processor = LFM2AudioProcessor.from_pretrained(HF_REPO).eval()
+                _model = LFM2AudioModel.from_pretrained(HF_REPO).eval()
+                print("[voice] Ready.", flush=True)
     return _model, _processor
 
 
-# ── Audio helpers ──────────────────────────────────────────────────────────────
-
-
-def bytes_to_tensor(audio_bytes: bytes, filename: str = "audio.ogg") -> tuple[torch.Tensor, int]:
-    """Convert raw audio bytes to (waveform_tensor, sample_rate)."""
+def bytes_to_tensor(data: bytes, filename: str) -> tuple[torch.Tensor, int]:
     suffix = Path(filename).suffix or ".ogg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
+        f.write(data)
+        tmp = f.name
     try:
-        wav, sr = torchaudio.load(tmp_path)
+        wav, sr = torchaudio.load(tmp)
         return wav, sr
     finally:
-        os.unlink(tmp_path)
+        os.unlink(tmp)
 
 
-def tensor_to_ogg(waveform: torch.Tensor, sample_rate: int = 24000) -> bytes:
-    """Convert waveform tensor to OGG Opus bytes."""
+def tensor_to_ogg(waveform: torch.Tensor, sr: int = 24000) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
-        tmp_path = f.name
+        tmp = f.name
     try:
-        torchaudio.save(tmp_path, waveform.cpu(), sample_rate, format="ogg")
-        with open(tmp_path, "rb") as f:
-            return f.read()
+        torchaudio.save(tmp, waveform.cpu(), sr, format="ogg")
+        return open(tmp, "rb").read()
     finally:
-        os.unlink(tmp_path)
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
+        os.unlink(tmp)
 
 
 @app.get("/health")
@@ -114,21 +74,20 @@ def health():
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """Transcribe an audio file to text using LFM2.5-Audio ASR."""
     data = await audio.read()
     if not data:
-        raise HTTPException(status_code=400, detail="Empty audio file")
+        raise HTTPException(400, "Empty file")
 
     model, processor = get_model()
 
     try:
-        from liquid_audio import ChatState, LFMModality
+        from liquid_audio import ChatState
 
         wav, sr = bytes_to_tensor(data, audio.filename or "audio.ogg")
 
         chat = ChatState(processor)
         chat.new_turn("system")
-        chat.add_text("Transcribe the following audio to text. Output only the transcript, nothing else.")
+        chat.add_text("Transcribe the audio accurately. Output only the transcript text, nothing else.")
         chat.end_turn()
         chat.new_turn("user")
         chat.add_audio(wav, sr)
@@ -138,31 +97,33 @@ async def transcribe(audio: UploadFile = File(...)):
         text_tokens: list[torch.Tensor] = []
         with torch.no_grad():
             for t in model.generate_sequential(**chat, max_new_tokens=512):
-                if t.numel() == 1:  # text token
+                if t.numel() == 1:
                     text_tokens.append(t)
 
-        transcript = processor.text.decode(torch.stack(text_tokens, dim=1)) if text_tokens else ""
+        transcript = ""
+        if text_tokens:
+            transcript = processor.text.decode(torch.stack(text_tokens, dim=1))
+
         return {"text": transcript.strip()}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 
 class SynthRequest(BaseModel):
     text: str
-    voice: Optional[str] = None  # reserved for future voice selection
+    voice: Optional[str] = None
 
 
 @app.post("/synthesize")
 async def synthesize(req: SynthRequest):
-    """Synthesize speech from text using LFM2.5-Audio TTS. Returns OGG audio."""
     if not req.text.strip():
-        raise HTTPException(status_code=400, detail="Empty text")
+        raise HTTPException(400, "Empty text")
 
     model, processor = get_model()
 
     try:
-        from liquid_audio import ChatState, LFMModality
+        from liquid_audio import ChatState
 
         chat = ChatState(processor)
         chat.new_turn("system")
@@ -176,18 +137,17 @@ async def synthesize(req: SynthRequest):
         audio_tokens: list[torch.Tensor] = []
         with torch.no_grad():
             for t in model.generate_sequential(**chat, max_new_tokens=2048):
-                if t.numel() > 1:  # audio token (multi-dim)
+                if t.numel() > 1:
                     audio_tokens.append(t)
 
         if not audio_tokens:
-            raise HTTPException(status_code=500, detail="Model produced no audio output")
+            raise HTTPException(500, "No audio generated")
 
-        # Last token is end-of-audio sentinel — drop it
+        # Drop the end-of-audio sentinel (last token)
         audio_codes = torch.stack(audio_tokens[:-1], dim=1).unsqueeze(0)
-        waveform = processor.decode(audio_codes)  # 24kHz mono
+        waveform = processor.decode(audio_codes)  # 24kHz
 
-        ogg_bytes = tensor_to_ogg(waveform, sample_rate=24000)
-        return Response(content=ogg_bytes, media_type="audio/ogg")
+        return Response(content=tensor_to_ogg(waveform, 24000), media_type="audio/ogg")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
