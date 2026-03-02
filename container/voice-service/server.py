@@ -8,13 +8,12 @@ Uses GGUF runner; no PyTorch. Model in /models via download-gguf.sh.
 API: https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF
 
 Tunables (env vars):
-  TTS_SPEED       Playback speed. 1.0 = natural, <1 = slower, >1 = faster (default: 0.95)
+  TTS_SPEED       Playback speed. 1.0 = natural, <1 = slower, >1 = faster (default: 1.0)
   TTS_TEMPERATURE Sampling temp. Higher = more varied/expressive (default: 0.95)
   TTS_TOP_P       Nucleus sampling (default: 0.95)
 """
 
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -28,7 +27,7 @@ CKPT = str(MODELS_DIR)
 CLI = MODELS_DIR / "llama-liquid-audio-cli"
 
 # Tunables — set via env or override here
-TTS_SPEED = float(os.environ.get("TTS_SPEED", "0.95"))
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
 TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.95"))
 TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
 
@@ -43,13 +42,6 @@ def _cli_args():
         "-mv", f"{CKPT}/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
         "--tts-speaker-file", f"{CKPT}/tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf",
     ]
-
-
-def _add_stage_directions(text: str) -> str:
-    """Insert stage directions for prosody. LFM may interpret [pause] etc."""
-    # Add [pause] after sentence boundaries for natural rhythm
-    text = re.sub(r"([.!?])\s+", r"\1 [pause] ", text)
-    return text.strip()
 
 
 def _ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
@@ -122,7 +114,8 @@ async def synthesize(req: SynthRequest):
         wav_path = Path(tmp) / "output.wav"
         ogg_path = Path(tmp) / "output.ogg"
 
-        prompt_text = _add_stage_directions(req.text)
+        # Delivery style in prompt: enthusiastic assistant with happy tone
+        prompt_text = f"Speak as an enthusiastic assistant with a happy tone: {req.text}"
         cmd = _cli_args() + [
             "-sys", "Perform TTS. Use the US male voice.",
             "-p", prompt_text,

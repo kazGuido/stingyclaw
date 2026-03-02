@@ -12,7 +12,7 @@ services:
       - voice-models:/models
     # TTS tunables (optional): TTS_SPEED, TTS_TEMPERATURE, TTS_TOP_P
     environment:
-      - TTS_SPEED=0.95
+      - TTS_SPEED=1
       - TTS_TEMPERATURE=0.95
       - TTS_TOP_P=0.95
 
