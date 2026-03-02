@@ -398,6 +398,24 @@ const TOOLS: OpenAI.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'register_group',
+      description: 'Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups.json (in /workspace/ipc/) to find the JID. When the user says they added you to a group, call this to activate it.',
+      parameters: {
+        type: 'object',
+        properties: {
+          jid: { type: 'string', description: 'WhatsApp JID (e.g. "120363336345536173@g.us")' },
+          name: { type: 'string', description: 'Display name for the group' },
+          folder: { type: 'string', description: 'Folder name (lowercase, hyphens, e.g. "family-chat")' },
+          trigger: { type: 'string', description: 'Trigger word (e.g. "@Andy")' },
+          requiresTrigger: { type: 'boolean', description: 'If false, bot replies to all messages. Default true for groups.' },
+        },
+        required: ['jid', 'name', 'folder', 'trigger'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'list_tasks',
       description: 'List all scheduled tasks.',
       parameters: { type: 'object', properties: {} },
@@ -694,6 +712,23 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         return 'Question sent. Stop and wait for the user\'s reply in the next message.';
+      }
+
+      case 'register_group': {
+        if (!input.isMain) {
+          return 'Only the main group can register new groups.';
+        }
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'register_group',
+          jid: args.jid as string,
+          name: args.name as string,
+          folder: args.folder as string,
+          trigger: args.trigger as string,
+          requiresTrigger: args.requiresTrigger as boolean | undefined,
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return `Group "${args.name}" registration requested. It will start receiving messages immediately.`;
       }
 
       case 'schedule_task': {

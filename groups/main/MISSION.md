@@ -146,7 +146,15 @@ Fields:
 - **Groups with `requiresTrigger: false`**: No trigger needed — all messages processed (use for 1-on-1 or solo chats)
 - **Other groups** (default): Messages must start with `@AssistantName` to be processed
 
-### Adding a Group
+### When the User Says They Added You to a Group
+
+If the user says they added you to a group (e.g. "did you see I added you to a group?"):
+1. Read `/workspace/ipc/available_groups.json` to find unregistered groups (`isRegistered: false`)
+2. If the list is empty or stale, first request a refresh: write `{"type":"refresh_groups"}` to `/workspace/ipc/tasks/refresh_$(date +%s).json`, wait a moment, then re-read available_groups.json
+3. Call `register_group` with the new group's jid, name, folder (e.g. slug from name), and trigger
+4. Confirm to the user that the group is now active
+
+### Adding a Group (manual)
 
 1. Query the database to find the group's JID
 2. Read `/workspace/project/data/registered_groups.json`
