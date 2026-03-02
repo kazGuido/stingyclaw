@@ -41,6 +41,15 @@ const MAX_TOOL_ITERATIONS = 60;
 /** Max chars of a tool result to keep in session. Prevents huge WebFetch/Bash output from blowing context. */
 const MAX_TOOL_RESULT_STORED_CHARS = 3000;
 
+/** Stored memory (consult/store) — state across turns to avoid context blow-up. */
+const AGENT_MEMORY_PATH = '/workspace/group/.agent-memory.json';
+const AGENT_MEMORY_MAX_ENTRIES = 50;
+const AGENT_MEMORY_MAX_CHARS = 12000;
+const MAX_SESSION_MESSAGES_WITH_MEMORY = 14;
+
+/** Current plan (plan → execute → summarize). */
+const AGENT_PLAN_PATH = '/workspace/group/.agent-current-plan.json';
+
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const OPENROUTER_DEFAULT_MODEL = 'liquid/lfm-2.5';
 
@@ -199,6 +208,80 @@ function saveSession(session: Session): void {
   fs.writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2));
 }
 
+// ─── Stored memory (consult/store) — state across turns ─────────────────────
+
+interface MemoryEntry {
+  t: string;
+  content: string;
+}
+
+function loadMemoryFile(): MemoryEntry[] {
+  try {
+    if (!fs.existsSync(AGENT_MEMORY_PATH)) return [];
+    const data = JSON.parse(fs.readFileSync(AGENT_MEMORY_PATH, 'utf-8')) as { entries?: MemoryEntry[] };
+    return Array.isArray(data.entries) ? data.entries : [];
+  } catch {
+    return [];
+  }
+}
+
+function getMemoryForPrompt(): string {
+  const entries = loadMemoryFile();
+  if (entries.length === 0) return '';
+  let out = '';
+  for (let i = entries.length - 1; i >= 0 && out.length < AGENT_MEMORY_MAX_CHARS; i--) {
+    const line = `[${entries[i].t}] ${entries[i].content}`;
+    out = out ? line + '\n' + out : line;
+  }
+  return out.slice(-AGENT_MEMORY_MAX_CHARS);
+}
+
+function appendStoredMemory(content: string): void {
+  const entries = loadMemoryFile();
+  entries.push({ t: new Date().toISOString(), content: content.slice(0, 2000) });
+  const trimmed = entries.slice(-AGENT_MEMORY_MAX_ENTRIES);
+  fs.mkdirSync(path.dirname(AGENT_MEMORY_PATH), { recursive: true });
+  fs.writeFileSync(AGENT_MEMORY_PATH, JSON.stringify({ entries: trimmed }, null, 2));
+}
+
+// ─── Current plan (plan → execute → summarize) ─────────────────────────────────
+
+interface CurrentPlan {
+  steps: string[];
+  createdAt: string;
+}
+
+function loadCurrentPlan(): CurrentPlan | null {
+  try {
+    if (!fs.existsSync(AGENT_PLAN_PATH)) return null;
+    const data = JSON.parse(fs.readFileSync(AGENT_PLAN_PATH, 'utf-8')) as CurrentPlan;
+    return data?.steps?.length ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function getPlanForPrompt(): string {
+  const plan = loadCurrentPlan();
+  if (!plan) return '';
+  return plan.steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
+}
+
+function setCurrentPlan(steps: string[]): void {
+  const trimmed = steps.slice(0, 30).map(s => String(s).slice(0, 500));
+  fs.mkdirSync(path.dirname(AGENT_PLAN_PATH), { recursive: true });
+  fs.writeFileSync(AGENT_PLAN_PATH, JSON.stringify({
+    steps: trimmed,
+    createdAt: new Date().toISOString(),
+  }, null, 2));
+}
+
+function clearCurrentPlan(): void {
+  try {
+    if (fs.existsSync(AGENT_PLAN_PATH)) fs.unlinkSync(AGENT_PLAN_PATH);
+  } catch { /* ignore */ }
+}
+
 function newSession(): Session {
   return {
     id: crypto.randomUUID(),
@@ -218,7 +301,9 @@ You have access to tools to complete tasks. Use them proactively.
 Be concise — WhatsApp messages should be short and to the point.
 For long-running work, use send_message to send intermediate updates.
 Your final text response (after all tool calls) is sent to the user automatically.
-When the user wants to see a screenshot or image in the chat (e.g. on WhatsApp), use send_image with the file path under /workspace/group.
+Screenshots and images — mandatory:
+- When the user asks to see a screenshot (or a page, diagram, image), you MUST call send_image(path) so the image appears in the chat. Do not only reply with text saying \"saved to page.png\".
+- After running \`agent-browser screenshot <filename>\`, immediately call send_image with that path (e.g. send_image(\"page.png\")) before any final text reply. Never Read an image file to show it — only send_image delivers it to the user.
 
 Working directory: /workspace/group — read/write files here freely.
 Extra directories may be mounted at /workspace/extra/*/
@@ -227,7 +312,7 @@ Web browsing — use agent-browser for any page that needs it:
 - \`agent-browser open <url>\` → navigate
 - \`agent-browser snapshot -i\` → get interactive elements (buttons, links, inputs) with refs like @e1, @e2
 - \`agent-browser click @e1\` / \`agent-browser fill @e2 "text"\` → interact via refs
-- \`agent-browser get text @e1\` / \`agent-browser screenshot page.png\` → extract content
+- \`agent-browser get text @e1\` / \`agent-browser screenshot page.png\` → extract content. After screenshot, always call send_image(\"page.png\") so the user sees it in the chat.
 - \`agent-browser close\` when done
 - Use WebFetch for simple static pages (faster). Use agent-browser for JS-heavy pages, login flows, or when you need to interact.
 
@@ -242,6 +327,10 @@ Workflows — pre-built automations the user has defined:
 - When the user asks you to do something → call search_tools("intent") first to check if a workflow exists
 - If found → run it with run_workflow(name, args)
 - If not found → use your built-in tools (Bash, WebFetch, etc.) directly
+
+Plan → Execute → Summarize (for efficient execution):
+- For any multi-step task (e.g. open URL, take screenshot, send image to chat), first call submit_plan with a short ordered list of steps. Then execute the steps in order with tool calls. Do not skip steps (e.g. after screenshot you must send_image). When done, call store_memory with a one-line summary and clear_plan.
+- If you see "Current plan" below, follow it step by step; then summarize and clear.
 
 Tell the boss — when stuck or unsure:
 - If you're not sure what to do, about to do something risky/irreversible, or need human approval, use ask_boss to ask the user first.
@@ -260,6 +349,16 @@ Tell the boss — when stuck or unsure:
     if (fs.existsSync(globalMd)) {
       parts.push('\n\n---\n' + fs.readFileSync(globalMd, 'utf-8'));
     }
+  }
+
+  const memoryContent = getMemoryForPrompt();
+  if (memoryContent) {
+    parts.push('\n\n---\nStored memory (context across turns; use consult_memory to read, store_memory to update):\n' + memoryContent);
+  }
+
+  const planContent = getPlanForPrompt();
+  if (planContent) {
+    parts.push('\n\n---\nCurrent plan (execute in order, then store_memory and clear_plan):\n' + planContent);
   }
 
   return parts.join('');
@@ -722,6 +821,32 @@ async function executeTool(
         return 'Session cleared. The next message will start a fresh conversation.';
       }
 
+      case 'store_memory': {
+        const content = (args.content as string) || '';
+        if (!content.trim()) return 'No content to store.';
+        appendStoredMemory(content.trim());
+        return 'Stored. It will be available in your context on the next turn.';
+      }
+
+      case 'consult_memory': {
+        const content = getMemoryForPrompt();
+        return content || '(No stored memory yet. Use store_memory to save summaries or facts.)';
+      }
+
+      case 'submit_plan': {
+        const steps = args.steps as string[] | undefined;
+        if (!Array.isArray(steps) || steps.length === 0) {
+          return 'Provide a non-empty array of steps, e.g. submit_plan({ steps: ["1. Open URL", "2. Screenshot", "3. send_image"] }).';
+        }
+        setCurrentPlan(steps);
+        return `Plan recorded (${steps.length} steps). Execute them in order with tool calls, then store_memory(summary) and clear_plan.`;
+      }
+
+      case 'clear_plan': {
+        clearCurrentPlan();
+        return 'Plan cleared.';
+      }
+
       default:
         return `Unknown tool: ${name}`;
     }
@@ -796,9 +921,15 @@ async function runQuery(
 
     log(`Model call #${i + 1} (${session.messages.length} messages in history)`);
 
+    // When stored memory exists, cap messages sent to API to avoid context blow-up; memory carries prior context.
+    const hasMemory = fs.existsSync(AGENT_MEMORY_PATH);
+    const messagesForApi =
+      hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
+        ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
+        : session.messages;
     // Strip provider-specific nulls (refusal, reasoning_details) and empty content
     // from assistant messages before sending — keeps the history clean regardless of model.
-    const sanitizedMessages = session.messages.map((m: any) => {
+    const sanitizedMessages = messagesForApi.map((m: any) => {
       if (m.role !== 'assistant') return m;
       const cleaned: any = { role: m.role };
       if (typeof m.content === 'string' && m.content !== '') cleaned.content = m.content;

@@ -117,7 +117,7 @@
     },
     {
       "name": "send_image",
-      "description": "Send an image to the WhatsApp chat (e.g. a screenshot). Use when the user wants to see a page, diagram, or any image. Path must be under /workspace/group (e.g. page.png or /workspace/group/page.png).",
+      "description": "Send an image to the WhatsApp chat so the user sees it. REQUIRED after agent-browser screenshot: call this with the screenshot path (e.g. page.png) before replying with text — otherwise the user never sees the image. Path must be under /workspace/group.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -206,6 +206,42 @@
       "parameters": { "type": "object", "properties": {} }
     },
     {
+      "name": "store_memory",
+      "description": "Store a short note or summary for future turns (e.g. what you did, what the user asked, key facts). Use after important steps so context is preserved without sending huge history. Stored memory is injected into your context each turn.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": { "type": "string", "description": "Short summary or fact to remember (e.g. 'User asked for screenshot of aelf.org; I took page.png and sent it via send_image')" }
+        },
+        "required": ["content"]
+      }
+    },
+    {
+      "name": "consult_memory",
+      "description": "Return the current stored memory (recent summaries and facts from store_memory). Use when you need to recall prior context. Stored memory is also injected into your system prompt each turn.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "submit_plan",
+      "description": "Submit your execution plan before doing multi-step tasks. Call this first with an ordered list of steps; then execute each step with tool calls. Ensures efficient execution and no skipped steps (e.g. send_image after screenshot).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Ordered list of steps, e.g. [\"Open URL with agent-browser\", \"Screenshot page.png\", \"send_image(page.png)\"]"
+          }
+        },
+        "required": ["steps"]
+      }
+    },
+    {
+      "name": "clear_plan",
+      "description": "Clear the current plan after you have executed it and stored a summary with store_memory. Call when the plan is done so the next turn starts fresh.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
       "name": "list_workflows",
       "description": "List all available workflows and automations in the registry. Call this when the user asks what you can do, what automations are available, or to browse capabilities.",
       "parameters": { "type": "object", "properties": {} }
@@ -238,6 +274,7 @@
   "defaultEnabledNonMain": [
     "Read", "Glob", "Grep", "WebFetch",
     "send_message", "send_voice", "send_image", "ask_boss",
+    "store_memory", "consult_memory", "submit_plan", "clear_plan",
     "list_workflows", "search_tools", "run_workflow",
     "list_tasks", "reset_session"
   ]
