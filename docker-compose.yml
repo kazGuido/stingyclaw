@@ -10,6 +10,11 @@ services:
     volumes:
       # LFM2.5-Audio model cache (HuggingFace) persists across rebuilds
       - voice-models:/models
+    # TTS tunables (optional): TTS_SPEED, TTS_TEMPERATURE, TTS_TOP_P
+    environment:
+      - TTS_SPEED=0.95
+      - TTS_TEMPERATURE=0.95
+      - TTS_TOP_P=0.95
 
 volumes:
   voice-models:

@@ -6,9 +6,15 @@ Voice service — LFM2.5-Audio-1.5B GGUF (llama-liquid-audio-cli)
 
 Uses GGUF runner; no PyTorch. Model in /models via download-gguf.sh.
 API: https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF
+
+Tunables (env vars):
+  TTS_SPEED       Playback speed. 1.0 = natural, <1 = slower, >1 = faster (default: 0.95)
+  TTS_TEMPERATURE Sampling temp. Higher = more varied/expressive (default: 0.95)
+  TTS_TOP_P       Nucleus sampling (default: 0.95)
 """
 
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +26,11 @@ from pydantic import BaseModel
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/models"))
 CKPT = str(MODELS_DIR)
 CLI = MODELS_DIR / "llama-liquid-audio-cli"
+
+# Tunables — set via env or override here
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "0.95"))
+TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.95"))
+TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
 
 app = FastAPI(title="Stingyclaw Voice — LFM2.5-Audio GGUF")
 
@@ -34,6 +45,13 @@ def _cli_args():
     ]
 
 
+def _add_stage_directions(text: str) -> str:
+    """Insert stage directions for prosody. LFM may interpret [pause] etc."""
+    # Add [pause] after sentence boundaries for natural rhythm
+    text = re.sub(r"([.!?])\s+", r"\1 [pause] ", text)
+    return text.strip()
+
+
 def _ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(ogg_path), "-ar", "16000", "-ac", "1", str(wav_path)],
@@ -42,9 +60,9 @@ def _ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
     )
 
 
-def _wav_to_ogg(wav_path: Path, ogg_path: Path, speed: float = 1.15) -> None:
-    # speed > 1 = faster (1.15 = ~15% faster, more energetic feel)
-    filters = f"atempo={speed}" if speed != 1.0 else ""
+def _wav_to_ogg(wav_path: Path, ogg_path: Path, speed: float | None = None) -> None:
+    s = speed if speed is not None else TTS_SPEED
+    filters = f"atempo={s}" if s != 1.0 else ""
     args = ["ffmpeg", "-y", "-i", str(wav_path)]
     if filters:
         args += ["-filter:a", filters]
@@ -104,10 +122,13 @@ async def synthesize(req: SynthRequest):
         wav_path = Path(tmp) / "output.wav"
         ogg_path = Path(tmp) / "output.ogg"
 
+        prompt_text = _add_stage_directions(req.text)
         cmd = _cli_args() + [
             "-sys", "Perform TTS. Use the US male voice.",
-            "-p", req.text,
+            "-p", prompt_text,
             "--output", str(wav_path),
+            "--temp", str(TTS_TEMPERATURE),
+            "--top-p", str(TTS_TOP_P),
         ]
         try:
             out = subprocess.run(
@@ -125,5 +146,5 @@ async def synthesize(req: SynthRequest):
             err = (out.stderr or out.stdout or b"").decode("utf-8", errors="replace")
             raise HTTPException(500, err or "TTS failed")
 
-        _wav_to_ogg(wav_path, ogg_path, speed=1.2)
+        _wav_to_ogg(wav_path, ogg_path)
         return Response(content=ogg_path.read_bytes(), media_type="audio/ogg")
