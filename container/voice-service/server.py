@@ -1,75 +1,58 @@
 """
-Voice service — LFM2.5-Audio-1.5B
+Voice service — LFM2.5-Audio-1.5B GGUF (llama-liquid-audio-cli)
   ASR:  POST /transcribe  — audio upload → {"text": "..."}
   TTS:  POST /synthesize  — {"text":"..."} → OGG audio
   GET   /health
 
-Model loaded once at startup, weights cached in /models via HuggingFace hub.
-API follows exactly: https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B
+Uses GGUF runner; no PyTorch. Model in /models via download-gguf.sh.
+API: https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF
 """
 
-import io
 import os
+import subprocess
 import tempfile
-import threading
 from pathlib import Path
-from typing import Optional
 
-import torch
-import torchaudio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-HF_REPO = "LiquidAI/LFM2.5-Audio-1.5B"
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/models"))
-os.environ.setdefault("HF_HOME", str(MODELS_DIR / "hf-cache"))
+CKPT = str(MODELS_DIR)
+CLI = MODELS_DIR / "llama-liquid-audio-cli"
 
-app = FastAPI(title="Stingyclaw Voice — LFM2.5-Audio")
-
-_model = None
-_processor = None
-_lock = threading.Lock()
+app = FastAPI(title="Stingyclaw Voice — LFM2.5-Audio GGUF")
 
 
-def get_model():
-    global _model, _processor
-    if _model is None:
-        with _lock:
-            if _model is None:
-                from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
-                print(f"[voice] Loading {HF_REPO}...", flush=True)
-                _processor = LFM2AudioProcessor.from_pretrained(HF_REPO).eval()
-                _model = LFM2AudioModel.from_pretrained(HF_REPO).eval()
-                print("[voice] Ready.", flush=True)
-    return _model, _processor
+def _cli_args():
+    return [
+        str(CLI),
+        "-m", f"{CKPT}/LFM2.5-Audio-1.5B-Q4_0.gguf",
+        "-mm", f"{CKPT}/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf",
+        "-mv", f"{CKPT}/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+        "--tts-speaker-file", f"{CKPT}/tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf",
+    ]
 
 
-def bytes_to_tensor(data: bytes, filename: str) -> tuple[torch.Tensor, int]:
-    suffix = Path(filename).suffix or ".ogg"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(data)
-        tmp = f.name
-    try:
-        wav, sr = torchaudio.load(tmp)
-        return wav, sr
-    finally:
-        os.unlink(tmp)
+def _ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(ogg_path), "-ar", "16000", "-ac", "1", str(wav_path)],
+        check=True,
+        capture_output=True,
+    )
 
 
-def tensor_to_ogg(waveform: torch.Tensor, sr: int = 24000) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
-        tmp = f.name
-    try:
-        torchaudio.save(tmp, waveform.cpu(), sr, format="ogg")
-        return open(tmp, "rb").read()
-    finally:
-        os.unlink(tmp)
+def _wav_to_ogg(wav_path: Path, ogg_path: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(wav_path), "-c:a", "libopus", str(ogg_path)],
+        check=True,
+        capture_output=True,
+    )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": HF_REPO}
+    return {"status": "ok", "model": "LiquidAI/LFM2.5-Audio-1.5B-GGUF"}
 
 
 @app.post("/transcribe")
@@ -78,41 +61,36 @@ async def transcribe(audio: UploadFile = File(...)):
     if not data:
         raise HTTPException(400, "Empty file")
 
-    model, processor = get_model()
+    with tempfile.TemporaryDirectory() as tmp:
+        ogg_path = Path(tmp) / "input.ogg"
+        wav_path = Path(tmp) / "input.wav"
+        ogg_path.write_bytes(data)
+        _ogg_to_wav(ogg_path, wav_path)
 
-    try:
-        from liquid_audio import ChatState
+        cmd = _cli_args() + ["-sys", "Perform ASR.", "--audio", str(wav_path)]
+        try:
+            out = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=120,
+                cwd=str(MODELS_DIR),
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "Transcription timed out")
+        except FileNotFoundError:
+            raise HTTPException(503, "llama-liquid-audio-cli not found; model may still be downloading")
 
-        wav, sr = bytes_to_tensor(data, audio.filename or "audio.ogg")
+        if out.returncode != 0:
+            err = (out.stderr or out.stdout or b"").decode("utf-8", errors="replace")
+            raise HTTPException(500, err or "ASR failed")
 
-        chat = ChatState(processor)
-        chat.new_turn("system")
-        chat.add_text("Transcribe the audio accurately. Output only the transcript text, nothing else.")
-        chat.end_turn()
-        chat.new_turn("user")
-        chat.add_audio(wav, sr)
-        chat.end_turn()
-        chat.new_turn("assistant")
-
-        text_tokens: list[torch.Tensor] = []
-        with torch.no_grad():
-            for t in model.generate_sequential(**chat, max_new_tokens=512):
-                if t.numel() == 1:
-                    text_tokens.append(t)
-
-        transcript = ""
-        if text_tokens:
-            transcript = processor.text.decode(torch.stack(text_tokens, dim=1))
-
-        return {"text": transcript.strip()}
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        text = (out.stdout or b"").decode("utf-8", errors="replace").strip()
+        return {"text": text}
 
 
 class SynthRequest(BaseModel):
     text: str
-    voice: Optional[str] = None
+    voice: str | None = None
 
 
 @app.post("/synthesize")
@@ -120,34 +98,30 @@ async def synthesize(req: SynthRequest):
     if not req.text.strip():
         raise HTTPException(400, "Empty text")
 
-    model, processor = get_model()
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = Path(tmp) / "output.wav"
+        ogg_path = Path(tmp) / "output.ogg"
 
-    try:
-        from liquid_audio import ChatState
+        cmd = _cli_args() + [
+            "-sys", "Perform TTS. Use the US male voice.",
+            "-p", req.text,
+            "--output", str(wav_path),
+        ]
+        try:
+            out = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=120,
+                cwd=str(MODELS_DIR),
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "Synthesis timed out")
+        except FileNotFoundError:
+            raise HTTPException(503, "llama-liquid-audio-cli not found; model may still be downloading")
 
-        chat = ChatState(processor)
-        chat.new_turn("system")
-        chat.add_text("Respond with audio only.")
-        chat.end_turn()
-        chat.new_turn("user")
-        chat.add_text(req.text)
-        chat.end_turn()
-        chat.new_turn("assistant")
+        if out.returncode != 0 or not wav_path.exists():
+            err = (out.stderr or out.stdout or b"").decode("utf-8", errors="replace")
+            raise HTTPException(500, err or "TTS failed")
 
-        audio_tokens: list[torch.Tensor] = []
-        with torch.no_grad():
-            for t in model.generate_sequential(**chat, max_new_tokens=2048):
-                if t.numel() > 1:
-                    audio_tokens.append(t)
-
-        if not audio_tokens:
-            raise HTTPException(500, "No audio generated")
-
-        # Drop the end-of-audio sentinel (last token)
-        audio_codes = torch.stack(audio_tokens[:-1], dim=1).unsqueeze(0)
-        waveform = processor.decode(audio_codes)  # 24kHz
-
-        return Response(content=tensor_to_ogg(waveform, 24000), media_type="audio/ogg")
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        _wav_to_ogg(wav_path, ogg_path)
+        return Response(content=ogg_path.read_bytes(), media_type="audio/ogg")
