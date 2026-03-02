@@ -1,0 +1,41 @@
+---
+description: Stingyclaw workflow — branch, rebuild, verify, merge, push
+alwaysApply: true
+---
+
+# Stingyclaw Workflow
+
+## Ship Checklist
+
+1. **New features** → work in a branch: `git checkout -b feature/name`
+2. **After code changes** → rebuild affected services: `docker compose build <service>`
+3. **Verify** → run tests, check for errors: `npm run build`, `npm test`, `docker compose up -d`
+4. **Merge** → `git checkout main && git merge feature/name`
+5. **Push** → `git push origin main`
+
+## Never Forget
+
+- **Docker changes** (Dockerfile, server.py, etc.) → `docker compose build voice` + `docker compose up -d voice`
+- **Always push** when done — uncommitted/unpushed work is lost work
+- **Rebuild before push** — ensure the image/artifact actually works
+
+## Quick Reference
+
+```bash
+# New feature
+git checkout -b feature/my-feature
+# ... make changes ...
+
+# Rebuild (voice service)
+docker compose build voice
+docker compose up -d voice
+
+# Verify
+npm run build
+npm test
+
+# Ship
+git add -A && git commit -m "feat: description"
+git checkout main && git merge feature/my-feature
+git push origin main
+```

@@ -114,11 +114,9 @@ async def synthesize(req: SynthRequest):
         wav_path = Path(tmp) / "output.wav"
         ogg_path = Path(tmp) / "output.ogg"
 
-        # Delivery style in prompt: enthusiastic assistant with happy tone
-        prompt_text = f"Speak as an enthusiastic assistant with a happy tone: {req.text}"
         cmd = _cli_args() + [
             "-sys", "Perform TTS. Use the US male voice.",
-            "-p", prompt_text,
+            "-p", req.text,
             "--output", str(wav_path),
             "--temp", str(TTS_TEMPERATURE),
             "--top-p", str(TTS_TOP_P),
