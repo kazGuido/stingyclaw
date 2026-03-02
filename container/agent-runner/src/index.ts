@@ -460,6 +460,14 @@ const TOOLS: OpenAI.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'reset_session',
+      description: 'Clear this chat\'s conversation history so the next message starts fresh. Use when the user asks to reset the session, clear memory, start over, or forget the conversation.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'list_workflows',
       description: 'List all available workflows and automations in the registry. Call this when the user asks what you can do, what automations are available, or to browse capabilities.',
       parameters: { type: 'object', properties: {} },
@@ -576,10 +584,16 @@ function resolvePath(p: string): string {
   return path.isAbsolute(p) ? p : path.join('/workspace/group', p);
 }
 
+interface SessionRef {
+  session: Session;
+  replaceWithNew?: boolean;
+}
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
   input: ContainerInput,
+  sessionRef?: SessionRef,
 ): Promise<string> {
   try {
     switch (name) {
@@ -825,6 +839,24 @@ async function executeTool(
         return `${name} requested for task ${String(args.task_id)}`;
       }
 
+      case 'reset_session': {
+        if (!sessionRef) return 'Error: reset_session requires session context.';
+        const sid = sessionRef.session.id;
+        const fp = sessionPath(sid);
+        try {
+          if (fs.existsSync(fp)) fs.unlinkSync(fp);
+        } catch (e) {
+          log(`reset_session: could not delete ${fp}: ${(e as Error).message}`);
+        }
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'clear_session',
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        sessionRef.replaceWithNew = true;
+        return 'Session cleared. The next message will start a fresh conversation.';
+      }
+
       default:
         return `Unknown tool: ${name}`;
     }
@@ -905,6 +937,7 @@ async function runQuery(
     }
 
     log(`Executing ${msg.tool_calls!.length} tool call(s)`);
+    const sessionRef: SessionRef = { session };
     for (const toolCall of msg.tool_calls!) {
       let args: Record<string, unknown>;
       try {
@@ -912,7 +945,14 @@ async function runQuery(
       } catch {
         args = { command: toolCall.function.arguments };
       }
-      const result = await executeTool(toolCall.function.name, args, input);
+      const result = await executeTool(toolCall.function.name, args, input, sessionRef);
+      if (sessionRef.replaceWithNew) {
+        session = newSession();
+        session.messages.push({ role: 'user', content: prompt });
+        session.messages.push(msg);
+        sessionRef.session = session;
+        sessionRef.replaceWithNew = false;
+      }
       session.messages.push({
         role: 'tool',
         tool_call_id: toolCall.id,

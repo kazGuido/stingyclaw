@@ -22,6 +22,7 @@ export interface IpcDeps {
   sendVoice: (jid: string, audioBuffer: Buffer) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
+  clearSession: (groupFolder: string) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -364,6 +365,11 @@ export async function processTaskIpc(
           'Unauthorized refresh_groups attempt blocked',
         );
       }
+      break;
+
+    case 'clear_session':
+      deps.clearSession(sourceGroup);
+      logger.info({ sourceGroup }, 'Session cleared via IPC');
       break;
 
     case 'register_group':

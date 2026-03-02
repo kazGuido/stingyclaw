@@ -17,6 +17,7 @@ import {
 } from './container-runner.js';
 import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
+  clearSession as clearSessionInDb,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -498,6 +499,10 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
+    clearSession: (groupFolder) => {
+      clearSessionInDb(groupFolder);
+      delete sessions[groupFolder];
+    },
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
