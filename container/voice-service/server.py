@@ -42,12 +42,14 @@ def _ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
     )
 
 
-def _wav_to_ogg(wav_path: Path, ogg_path: Path) -> None:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(wav_path), "-c:a", "libopus", str(ogg_path)],
-        check=True,
-        capture_output=True,
-    )
+def _wav_to_ogg(wav_path: Path, ogg_path: Path, speed: float = 1.15) -> None:
+    # speed > 1 = faster (1.15 = ~15% faster, more energetic feel)
+    filters = f"atempo={speed}" if speed != 1.0 else ""
+    args = ["ffmpeg", "-y", "-i", str(wav_path)]
+    if filters:
+        args += ["-filter:a", filters]
+    args += ["-c:a", "libopus", str(ogg_path)]
+    subprocess.run(args, check=True, capture_output=True)
 
 
 @app.get("/health")
@@ -123,5 +125,5 @@ async def synthesize(req: SynthRequest):
             err = (out.stderr or out.stdout or b"").decode("utf-8", errors="replace")
             raise HTTPException(500, err or "TTS failed")
 
-        _wav_to_ogg(wav_path, ogg_path)
+        _wav_to_ogg(wav_path, ogg_path, speed=1.2)
         return Response(content=ogg_path.read_bytes(), media_type="audio/ogg")
