@@ -33,6 +33,8 @@ const IPC_POLL_MS = 500;
 
 const SESSIONS_DIR = '/home/node/.stingyclaw/sessions';
 const MAX_TOOL_ITERATIONS = 60;
+/** Max chars of a tool result to keep in session. Prevents huge WebFetch/Bash output from blowing context. */
+const MAX_TOOL_RESULT_STORED_CHARS = 3000;
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const OPENROUTER_DEFAULT_MODEL = 'liquid/lfm-2.5';
@@ -953,10 +955,16 @@ async function runQuery(
         sessionRef.session = session;
         sessionRef.replaceWithNew = false;
       }
+      // Don't keep full webpage/huge output in context — truncate so future turns stay under token limits
+      const storedContent =
+        result.length <= MAX_TOOL_RESULT_STORED_CHARS
+          ? result
+          : result.slice(0, MAX_TOOL_RESULT_STORED_CHARS) +
+            '\n[Truncated for context. Full output was used in that turn.]';
       session.messages.push({
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: result,
+        content: storedContent,
       });
     }
   }
