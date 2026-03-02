@@ -104,27 +104,36 @@ SQLite → Host polling loop
     ↓
 Agent Container (Docker, isolated per-group)
     ├── Primary model (Gemini / OpenRouter / Ollama)
-    ├── Built-in tools: Bash, Read, Write, Edit, Grep, Glob,
-    │                   WebFetch, agent-browser, send_message,
-    │                   send_voice, ask_boss, schedule_task,
-    │                   list_workflows, search_tools, run_workflow
+    ├── Tool registry (container/agent-runner/tool-registry.json) — single source of truth
+    │   Tools filtered by context: main = all; others = tools-enabled.json or default allowlist
+    ├── Sensitive tools (Bash, Write, register_group, …) → confirmation_required → ask_boss preview
+    ├── Audit log → data/ipc/<group>/audit.jsonl (who, when, tool, success, result size)
     └── Workflow registry (groups/*/workflows/registry.json)
     ↓ send_voice IPC
 Voice Service → Qwen3-TTS → OGG → WhatsApp PTT reply
 ```
 
-One Node.js host process. Each message spawns an isolated Docker container. The container exits after the conversation goes idle. Sessions are persisted and resumed.
+One Node.js host process. Each message spawns an isolated Docker container. The container exits after the conversation goes idle. Sessions are persisted and resumed. Optional **MCP** exposure of the same tools is documented in [docs/MCP-ROADMAP.md](docs/MCP-ROADMAP.md).
 
 ---
 
 ## Agent capabilities
 
-### Built-in tools (always available)
+### Tool registry and permissions
+
+All tools are defined in **`container/agent-runner/tool-registry.json`** (single source of truth). The agent receives only the tools **enabled for that context**:
+
+- **Main group**: all tools.
+- **Other groups**: either a JSON array in **`groups/<name>/tools-enabled.json`** (list of tool names), or the registry’s **default allowlist** (e.g. Read, Glob, Grep, WebFetch, send_*, ask_boss, list_workflows, search_tools, run_workflow, list_tasks, reset_session — no Bash, Write, register_group, etc.).
+
+So “anybody shouldn’t be allowed to do anything” — boss/main gets full power; group chats get a restricted set unless you explicitly allow more via `tools-enabled.json`.
+
+### Tools (from registry)
 
 | Tool | What it does |
 |------|-------------|
-| `Bash` | Run any shell command in the group sandbox |
-| `Read` / `Write` / `Edit` | File operations in `/workspace/group/` |
+| `Bash` | Run any shell command in the group sandbox *(confirmation required)* |
+| `Read` / `Write` / `Edit` | File operations in `/workspace/group/` *(Write/Edit: confirmation)* |
 | `Grep` / `Glob` | Search files |
 | `WebFetch` | Fetch static pages (fast, no JS) |
 | `agent-browser` | Full headless browser via Bash — JS pages, click, fill, screenshot |
@@ -132,9 +141,14 @@ One Node.js host process. Each message spawns an isolated Docker container. The 
 | `send_voice` | Send WhatsApp voice note (Qwen3-TTS) |
 | `ask_boss` | Ask the user for guidance before risky actions |
 | `schedule_task` | Schedule recurring or one-time agent tasks |
+| `register_group` | Register a new WhatsApp group *(main only; confirmation required)* |
+| `list_tasks` / `pause_task` / `resume_task` / `cancel_task` | Manage scheduled tasks |
+| `reset_session` | Clear conversation history for this chat |
 | `list_workflows` | Show all registered automations |
 | `search_tools` | Semantic search over workflow registry |
-| `run_workflow` | Execute a workflow by name |
+| `run_workflow` | Execute a workflow by name *(confirmation required)* |
+
+Tools marked *confirmation required* in the registry trigger an **ask_boss-style preview** (“About to run: … Reply yes to confirm or no to cancel”); the next user message is treated as confirm/cancel. **Audit log**: every tool call is appended to `data/ipc/<group>/audit.jsonl` (timestamp, group, chat, tool, success, result size).
 
 ### Web browsing
 
@@ -205,26 +219,30 @@ Each group has a `groups/{name}/MISSION.md` injected into the system prompt. Thi
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Orchestrator: message loop, agent invocation |
+| `src/index.ts` | Orchestrator: message loop, agent invocation, confirmation preview handling |
 | `src/channels/whatsapp.ts` | WhatsApp connection, send/receive |
 | `src/container-runner.ts` | Spawn agent containers, pass secrets via stdin |
 | `src/ipc.ts` | IPC watcher: messages, voice, tasks |
 | `src/task-scheduler.ts` | Scheduled task runner |
 | `src/transcription.ts` | ASR + TTS HTTP client |
-| `container/agent-runner/src/index.ts` | **Agent loop** — all tools, session management |
+| `container/agent-runner/src/index.ts` | **Agent loop** — registry-driven tools, session, audit, confirmation |
+| `container/agent-runner/tool-registry.json` | **Tool registry** — names, params, confirmation_required, default allowlist |
 | `container/Dockerfile` | Agent image (Node + ripgrep + agent-browser + embedding model) |
 | `container/voice-service/` | FastAPI: `/transcribe` (Whisper) + `/synthesize` (Qwen3-TTS) |
 | `docker-compose.yml` | Voice service container |
 | `groups/*/MISSION.md` | Per-group persona and memory |
+| `groups/*/tools-enabled.json` | Optional: list of allowed tool names for that group |
 | `groups/*/workflows/registry.json` | Per-group workflow registry |
+| `data/ipc/<group>/audit.jsonl` | Audit log: who, when, which tool, success, result size |
+| `docs/MCP-ROADMAP.md` | Optional MCP server for tools (future) |
 
 ---
 
 ## Roadmap / what to build next
 
-The current build is a solid foundation. Here's what comes next:
+The current build is a solid foundation. Architecture is aligned around a **tool registry** (single source of truth), **configurable enabled tools per context**, **audit log**, and **confirmation_required** for sensitive tools. See [docs/MCP-ROADMAP.md](docs/MCP-ROADMAP.md) for how to add an optional MCP server later without rewriting the stack.
 
-- **MCP client** — connect to any MCP server (Gmail, GitHub, Slack) for dynamic tool loading without code changes
+- **Optional MCP server** — expose the same tools via MCP for other clients (see MCP-ROADMAP.md)
 - **Richer workflow args** — typed inputs, validation, prompting for missing args before running
 - **n8n / webhook bridge** — call external automation platforms from registry scripts
 - **Group onboarding** — auto-prompt new groups for their mission/context on first message

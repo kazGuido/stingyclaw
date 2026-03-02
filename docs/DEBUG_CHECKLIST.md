@@ -63,7 +63,8 @@ echo '{"group":"main","message":"test","history":[]}' | docker run --rm -i \
 
 # Check image build date vs last code change
 docker inspect nanoclaw-agent:latest --format '{{.Created}}'
-ls -la container/agent-runner/src/index.ts
+ls -la container/agent-runner/src/index.ts container/agent-runner/tool-registry.json
+# Last tool calls (audit log): tail -20 data/ipc/main/audit.jsonl
 ```
 
 ---

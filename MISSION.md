@@ -18,8 +18,11 @@ Single Node.js process that connects to WhatsApp, routes messages to agents runn
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
-| `container/agent-runner/src/index.ts` | Agent loop (OpenAI-compatible, OpenRouter/Ollama) |
+| `container/agent-runner/src/index.ts` | Agent loop: registry-driven tools, session, audit, confirmation |
+| `container/agent-runner/tool-registry.json` | Tool definitions, confirmation_required, default allowlist |
 | `groups/{name}/MISSION.md` | Per-group memory and persona |
+| `groups/{name}/tools-enabled.json` | Optional: allowed tool names for that group |
+| `data/ipc/<group>/audit.jsonl` | Tool call audit (who, when, tool, success, result size) |
 
 ## Development
 

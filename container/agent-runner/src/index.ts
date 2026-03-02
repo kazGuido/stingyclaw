@@ -4,10 +4,14 @@
  * OpenAI-compatible agentic loop. Two backends:
  *   1. OpenRouter — set OPENROUTER_API_KEY + MODEL_NAME (default)
  *   2. Local Ollama — set OPENROUTER_API_KEY=ollama
+ *
+ * Tools: loaded from tool registry (single source of truth). Filtered by
+ * enabled-tools config per context (main vs group). Optional MCP later.
  */
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
@@ -28,6 +32,7 @@ const IPC_DIR = '/workspace/ipc';
 const IPC_INPUT_DIR = `${IPC_DIR}/input`;
 const IPC_MESSAGES_DIR = `${IPC_DIR}/messages`;
 const IPC_TASKS_DIR = `${IPC_DIR}/tasks`;
+const IPC_AUDIT_FILE = `${IPC_DIR}/audit.jsonl`;
 const IPC_INPUT_CLOSE_SENTINEL = `${IPC_INPUT_DIR}/_close`;
 const IPC_POLL_MS = 500;
 
@@ -40,6 +45,75 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const OPENROUTER_DEFAULT_MODEL = 'liquid/lfm-2.5';
 
 type Backend = 'openrouter' | 'ollama';
+
+// ─── Tool registry (single source of truth; enables MCP + per-context filtering) ─
+
+interface ToolRegistryEntry {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  confirmation_required?: boolean;
+  destructive?: boolean;
+}
+
+interface ToolRegistry {
+  tools: ToolRegistryEntry[];
+  defaultEnabledNonMain?: string[];
+}
+
+let cachedRegistry: ToolRegistry | null = null;
+
+function loadToolRegistry(): ToolRegistry {
+  if (cachedRegistry) return cachedRegistry;
+  const candidates = [
+    '/app/tool-registry.json',
+    path.join(process.cwd(), 'tool-registry.json'),
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'tool-registry.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        cachedRegistry = JSON.parse(fs.readFileSync(p, 'utf-8')) as ToolRegistry;
+        log(`Tool registry loaded from ${p} (${cachedRegistry.tools.length} tools)`);
+        return cachedRegistry;
+      }
+    } catch (e) {
+      log(`Tool registry skip ${p}: ${(e as Error).message}`);
+    }
+  }
+  throw new Error('tool-registry.json not found. Tried: ' + candidates.join(', '));
+}
+
+function buildOpenAITools(registry: ToolRegistry): OpenAI.ChatCompletionTool[] {
+  return registry.tools.map((t) => ({
+    type: 'function' as const,
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    },
+  }));
+}
+
+function getToolMeta(registry: ToolRegistry, name: string): ToolRegistryEntry | undefined {
+  return registry.tools.find((t) => t.name === name);
+}
+
+/** Enabled tool names for this context. Main: all; others: tools-enabled.json or default. */
+function getEnabledToolNames(registry: ToolRegistry, isMain: boolean): string[] {
+  const allNames = registry.tools.map((t) => t.name);
+  if (isMain) return allNames;
+  const enabledPath = '/workspace/group/tools-enabled.json';
+  try {
+    if (fs.existsSync(enabledPath)) {
+      const list = JSON.parse(fs.readFileSync(enabledPath, 'utf-8')) as string[];
+      return list.filter((n) => allNames.includes(n));
+    }
+  } catch {
+    /* use default */
+  }
+  return (registry.defaultEnabledNonMain ?? []).filter((n) => allNames.includes(n));
+}
 
 // ─── Local embedder (lazy-loaded, shared across tool calls) ──────────────────
 
@@ -70,10 +144,20 @@ interface ContainerInput {
 }
 
 interface ContainerOutput {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'confirmation_required';
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** When status is confirmation_required: message to show user (e.g. ask_boss preview). */
+  confirmationPreview?: string;
+  /** When status is confirmation_required: tool name and args for audit/logging. */
+  pendingTool?: { name: string; args: Record<string, unknown> };
+}
+
+interface PendingConfirmation {
+  toolCallId: string;
+  name: string;
+  args: Record<string, unknown>;
 }
 
 interface Session {
@@ -81,6 +165,8 @@ interface Session {
   messages: OpenAI.ChatCompletionMessageParam[];
   createdAt: string;
   updatedAt: string;
+  /** Set when a confirmation_required tool was requested; cleared after user confirms/cancels. */
+  pendingConfirmation?: PendingConfirmation | null;
 }
 
 function writeOutput(output: ContainerOutput): void {
@@ -132,6 +218,7 @@ You have access to tools to complete tasks. Use them proactively.
 Be concise — WhatsApp messages should be short and to the point.
 For long-running work, use send_message to send intermediate updates.
 Your final text response (after all tool calls) is sent to the user automatically.
+When the user wants to see a screenshot or image in the chat (e.g. on WhatsApp), use send_image with the file path under /workspace/group.
 
 Working directory: /workspace/group — read/write files here freely.
 Extra directories may be mounted at /workspace/extra/*/
@@ -229,282 +316,36 @@ function waitForIpcMessage(): Promise<string | null> {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-const TOOLS: OpenAI.ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'Bash',
-      description: 'Execute a bash command. Working directory: /workspace/group. Returns stdout + stderr.',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: 'The bash command to execute' },
-          timeout: { type: 'number', description: 'Timeout in ms (default 30000, max 120000)' },
-        },
-        required: ['command'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'Read',
-      description: 'Read a file and return its contents with line numbers.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or relative (from /workspace/group) file path' },
-          offset: { type: 'number', description: 'Start line number (1-indexed)' },
-          limit: { type: 'number', description: 'Maximum lines to return' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'Write',
-      description: 'Write content to a file (creates parent directories as needed).',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or relative file path' },
-          content: { type: 'string', description: 'Content to write' },
-        },
-        required: ['path', 'content'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'Edit',
-      description: 'Replace a specific string in a file. old_string must appear exactly once in the file.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'File path' },
-          old_string: { type: 'string', description: 'Exact text to replace (must be unique in the file)' },
-          new_string: { type: 'string', description: 'Replacement text' },
-        },
-        required: ['path', 'old_string', 'new_string'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'Glob',
-      description: 'Find files matching a glob pattern.',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Glob pattern, e.g. "**/*.ts" or "*.json"' },
-          directory: { type: 'string', description: 'Search root directory (default: /workspace/group)' },
-        },
-        required: ['pattern'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'Grep',
-      description: 'Search file contents using ripgrep. Returns matching lines with file:line context.',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Regex or literal search pattern' },
-          path: { type: 'string', description: 'File or directory to search (default: /workspace/group)' },
-          flags: { type: 'string', description: 'Extra rg flags e.g. "-i" (case insensitive), "-l" (filenames only)' },
-        },
-        required: ['pattern'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'WebFetch',
-      description: 'Fetch a URL and return its text content (HTML stripped).',
-      parameters: {
-        type: 'object',
-        properties: {
-          url: { type: 'string', description: 'URL to fetch' },
-        },
-        required: ['url'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_message',
-      description: 'Send a WhatsApp text message to the chat right now (before finishing). Use for progress updates.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Message text to send' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_voice',
-      description: 'Send a WhatsApp voice note (spoken audio). Use for natural conversational replies, especially when the user sent a voice message. Keep text short — under ~200 words.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Text to speak aloud as a voice note' },
-          voice: { type: 'string', description: 'Optional speaker: Ryan, Aiden, Vivian, Serena, Uncle_Fu, Dylan, Eric, Ono_Anna, Sohee (default: Ryan)' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'ask_boss',
-      description: 'Ask the user (the boss) for guidance when stuck, unsure, or before doing something risky/irreversible. Your question is sent to the chat. Stop and wait for their reply — do not proceed until you have it. Use when: ambiguous request, destructive action, sensitive data, or you lack context.',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'Clear question or context for the user to respond to' },
-        },
-        required: ['question'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'schedule_task',
-      description: 'Schedule a recurring or one-time task that runs as an agent.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'What the agent should do when the task runs' },
-          schedule_type: { type: 'string', enum: ['cron', 'interval', 'once'], description: 'cron=time-based, interval=every N ms, once=run once' },
-          schedule_value: { type: 'string', description: 'cron: "0 9 * * *" | interval: ms like "3600000" | once: local ISO "2026-02-01T15:30:00" (no Z!)' },
-          context_mode: { type: 'string', enum: ['group', 'isolated'], description: 'group=with chat history, isolated=fresh session (include context in prompt)' },
-        },
-        required: ['prompt', 'schedule_type', 'schedule_value'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'register_group',
-      description: 'Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups.json (in /workspace/ipc/) to find the JID. When the user says they added you to a group, call this to activate it.',
-      parameters: {
-        type: 'object',
-        properties: {
-          jid: { type: 'string', description: 'WhatsApp JID (e.g. "120363336345536173@g.us")' },
-          name: { type: 'string', description: 'Display name for the group' },
-          folder: { type: 'string', description: 'Folder name (lowercase, hyphens, e.g. "family-chat")' },
-          trigger: { type: 'string', description: 'Trigger word (e.g. "@Andy")' },
-          requiresTrigger: { type: 'boolean', description: 'If false, bot replies to all messages. Default true for groups.' },
-        },
-        required: ['jid', 'name', 'folder', 'trigger'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_tasks',
-      description: 'List all scheduled tasks.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'pause_task',
-      description: 'Pause a scheduled task by ID.',
-      parameters: {
-        type: 'object',
-        properties: { task_id: { type: 'string', description: 'Task ID to pause' } },
-        required: ['task_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'resume_task',
-      description: 'Resume a paused task by ID.',
-      parameters: {
-        type: 'object',
-        properties: { task_id: { type: 'string', description: 'Task ID to resume' } },
-        required: ['task_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cancel_task',
-      description: 'Cancel and delete a scheduled task by ID.',
-      parameters: {
-        type: 'object',
-        properties: { task_id: { type: 'string', description: 'Task ID to cancel' } },
-        required: ['task_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'reset_session',
-      description: 'Clear this chat\'s conversation history so the next message starts fresh. Use when the user asks to reset the session, clear memory, start over, or forget the conversation.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_workflows',
-      description: 'List all available workflows and automations in the registry. Call this when the user asks what you can do, what automations are available, or to browse capabilities.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'search_tools',
-      description: 'Search the workflow registry for tools/automations by keyword or intent. Returns matching entries with name, description, and how to run them. Call this first when the user asks you to do something that might be a pre-built workflow.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Keywords describing what you want to do, e.g. "morning briefing", "send slack message", "fetch leads"' },
-        },
-        required: ['query'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'run_workflow',
-      description: 'Run a workflow by name from the registry. Optionally pass arguments as a JSON object.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Workflow name from the registry' },
-          args: { type: 'object', description: 'Optional key-value arguments passed as environment variables to the script', additionalProperties: { type: 'string' } },
-        },
-        required: ['name'],
-      },
-    },
-  },
-];
+// Tools are built from tool-registry.json and filtered by context (see getToolsForContext).
+
+function getToolsForContext(input: ContainerInput): OpenAI.ChatCompletionTool[] {
+  const registry = loadToolRegistry();
+  const all = buildOpenAITools(registry);
+  const enabled = new Set(getEnabledToolNames(registry, input.isMain));
+  return all.filter((t) => t.function && enabled.has(t.function.name));
+}
+
+/** Append one line to the audit log (who, when, tool, success, result size). */
+function auditLog(
+  input: ContainerInput,
+  toolName: string,
+  success: boolean,
+  resultSizeBytes: number,
+): void {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      groupFolder: input.groupFolder,
+      chatJid: input.chatJid,
+      tool: toolName,
+      success,
+      resultSizeBytes,
+    }) + '\n';
+    fs.appendFileSync(IPC_AUDIT_FILE, line);
+  } catch (e) {
+    log(`Audit log write failed: ${(e as Error).message}`);
+  }
+}
 
 // ─── Semantic search helpers ──────────────────────────────────────────────────
 
@@ -717,6 +558,28 @@ async function executeTool(
         return 'Voice message queued for sending.';
       }
 
+      case 'send_image': {
+        const groupBase = '/workspace/group';
+        const rawPath = String((args.path as string) || '').trim();
+        const resolved = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(groupBase, rawPath);
+        const relativePath = path.relative(groupBase, resolved);
+        if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+          return 'Invalid path: image must be under /workspace/group.';
+        }
+        if (!fs.existsSync(resolved)) {
+          return `File not found: ${resolved}`;
+        }
+        writeIpcFile(IPC_MESSAGES_DIR, {
+          type: 'image_message',
+          chatJid: input.chatJid,
+          relativePath: path.normalize(relativePath),
+          caption: (args.caption as string) || undefined,
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Image sent to chat.';
+      }
+
       case 'ask_boss': {
         const q = (args.question as string) || 'Need your input.';
         const text = `Need your input: ${q}`;
@@ -871,16 +734,57 @@ async function executeTool(
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
+function buildConfirmationPreview(name: string, args: Record<string, unknown>): string {
+  const maxArgLen = 80;
+  const parts = Object.entries(args).map(([k, v]) => {
+    const str = typeof v === 'string' ? v : JSON.stringify(v);
+    const display = str.length > maxArgLen ? str.slice(0, maxArgLen) + '…' : str;
+    return `${k}=${display}`;
+  });
+  return `About to run: ${name}(${parts.join(', ')}). Reply "yes" to confirm or "no" to cancel.`;
+}
+
 async function runQuery(
   prompt: string,
   session: Session,
   input: ContainerInput,
   client: OpenAI,
   modelName: string,
-): Promise<{ result: string | null; closed: boolean }> {
+): Promise<{
+  result: string | null;
+  closed: boolean;
+  confirmationRequired?: { preview: string; pendingTool: { name: string; args: Record<string, unknown> } };
+}> {
+  const registry = loadToolRegistry();
   const systemPrompt = buildSystemPrompt(input);
-  session.messages.push({ role: 'user', content: prompt });
 
+  // Resuming from confirmation: user replied yes/no; execute or cancel pending tool, then continue loop.
+  if (session.pendingConfirmation && prompt) {
+    const reply = prompt.trim().toLowerCase();
+    const confirmed = /^(yes|confirm|ok|y)$/.test(reply);
+    const pending = session.pendingConfirmation;
+    session.pendingConfirmation = null;
+    let result: string;
+    const sessionRef: SessionRef = { session };
+    if (confirmed) {
+      result = await executeTool(pending.name, pending.args, input, sessionRef);
+      auditLog(input, pending.name, !result.startsWith('Error'), Buffer.byteLength(result, 'utf8'));
+    } else {
+      result = 'User cancelled.';
+      auditLog(input, pending.name, false, 0);
+    }
+    const storedContent =
+      result.length <= MAX_TOOL_RESULT_STORED_CHARS
+        ? result
+        : result.slice(0, MAX_TOOL_RESULT_STORED_CHARS) + '\n[Truncated for context. Full output was used in that turn.]';
+    session.messages.push({ role: 'tool', tool_call_id: pending.toolCallId, content: storedContent });
+    saveSession(session);
+    // Fall through to loop; do not push user message.
+  } else {
+    session.messages.push({ role: 'user', content: prompt });
+  }
+
+  const toolsForContext = getToolsForContext(input);
   let lastText: string | null = null;
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
@@ -907,7 +811,7 @@ async function runQuery(
       response = await client.chat.completions.create({
         model: modelName,
         messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
-        tools: TOOLS,
+        tools: toolsForContext,
         tool_choice: 'auto',
         max_tokens: 8192,
       });
@@ -947,7 +851,23 @@ async function runQuery(
       } catch {
         args = { command: toolCall.function.arguments };
       }
+      const toolMeta = getToolMeta(registry, toolCall.function.name);
+      if (toolMeta?.confirmation_required) {
+        session.pendingConfirmation = {
+          toolCallId: toolCall.id,
+          name: toolCall.function.name,
+          args,
+        };
+        saveSession(session);
+        const preview = buildConfirmationPreview(toolCall.function.name, args);
+        return {
+          result: null,
+          closed: false,
+          confirmationRequired: { preview, pendingTool: { name: toolCall.function.name, args } },
+        };
+      }
       const result = await executeTool(toolCall.function.name, args, input, sessionRef);
+      auditLog(input, toolCall.function.name, !result.startsWith('Error'), Buffer.byteLength(result, 'utf8'));
       if (sessionRef.replaceWithNew) {
         session = newSession();
         session.messages.push({ role: 'user', content: prompt });
@@ -1050,11 +970,21 @@ async function main(): Promise<void> {
   try {
     while (true) {
       log(`Starting query (session: ${session.id})...`);
-      const { result, closed } = await runQuery(prompt, session, input, client, modelName);
+      const runResult = await runQuery(prompt, session, input, client, modelName);
 
-      writeOutput({ status: 'success', result, newSessionId: session.id });
+      if (runResult.confirmationRequired) {
+        writeOutput({
+          status: 'confirmation_required',
+          result: null,
+          newSessionId: session.id,
+          confirmationPreview: runResult.confirmationRequired.preview,
+          pendingTool: runResult.confirmationRequired.pendingTool,
+        });
+      } else {
+        writeOutput({ status: 'success', result: runResult.result, newSessionId: session.id });
+      }
 
-      if (closed || shouldClose()) {
+      if (runResult.closed || shouldClose()) {
         log('Exiting after close sentinel');
         break;
       }

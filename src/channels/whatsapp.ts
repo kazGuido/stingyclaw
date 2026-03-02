@@ -21,7 +21,7 @@ import {
   updateChatName,
 } from '../db.js';
 import { logger } from '../logger.js';
-import { isVoiceMessage, transcribeVoiceMessage } from '../transcription.js';
+import { isAudioMessage, transcribeVoiceMessage } from '../transcription.js';
 import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -193,8 +193,8 @@ export class WhatsAppChannel implements Channel {
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
-          // Handle voice notes: download + transcribe, deliver as [Voice: text]
-          if (isVoiceMessage(msg)) {
+          // Handle voice notes and any audio (e.g. call recordings): download + transcribe, deliver as [Voice: text]
+          if (isAudioMessage(msg)) {
             const transcript = await transcribeVoiceMessage(msg, this.sock);
             const content = transcript
               ? `[Voice: ${transcript}]`
@@ -295,6 +295,22 @@ export class WhatsAppChannel implements Channel {
       // If send fails, queue it for retry on reconnect
       this.outgoingQueue.push({ jid, text: prefixed });
       logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
+    }
+  }
+
+  async sendImage(jid: string, imageBuffer: Buffer, caption?: string): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid }, 'WA disconnected, dropping image');
+      return;
+    }
+    try {
+      await this.sock.sendMessage(jid, {
+        image: imageBuffer,
+        caption: caption ? `${ASSISTANT_NAME}: ${caption}` : undefined,
+      });
+      logger.info({ jid, bytes: imageBuffer.length }, 'Image sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send image');
     }
   }
 

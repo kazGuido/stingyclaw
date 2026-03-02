@@ -191,6 +191,14 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
+    if (result.status === 'confirmation_required' && result.confirmationPreview) {
+      await channel.sendMessage(chatJid, result.confirmationPreview);
+      outputSentToUser = true;
+      resetIdleTimer();
+      // Do not notifyIdle: container is waiting for user reply
+      return;
+    }
+
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
@@ -496,6 +504,12 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       if (!channel.sendVoice) throw new Error(`Channel ${channel.name} does not support voice`);
       return channel.sendVoice(jid, audioBuffer);
+    },
+    sendImage: (jid, imageBuffer, caption) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendImage) throw new Error(`Channel ${channel.name} does not support images`);
+      return channel.sendImage(jid, imageBuffer, caption);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

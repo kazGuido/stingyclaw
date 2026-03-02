@@ -59,11 +59,9 @@ A personal AI assistant accessible via WhatsApp, with local voice, persistent me
 │  │    • data/ipc/       → /workspace/ipc    (rw)                 │   │
 │  │    • agent-runner/src → /app/src         (synced on spawn)    │   │
 │  │                                                               │   │
-│  │  Tools: Bash, Read, Write, Edit, Glob, Grep,                  │   │
-│  │         WebFetch, agent-browser,                              │   │
-│  │         send_message, send_voice, ask_boss,                   │   │
-│  │         schedule_task, list_workflows,                        │   │
-│  │         search_tools, run_workflow                            │   │
+│  │  Tools: from tool-registry.json; filtered by context          │   │
+│  │  (main = all; others = tools-enabled.json or default);       │   │
+│  │  confirmation_required → ask_boss preview; audit → audit.jsonl│   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
@@ -98,12 +96,15 @@ stingyclaw/
 ├── src/                     # Host process
 ├── container/
 │   ├── Dockerfile            # Agent image
-│   ├── agent-runner/src/     # Agent loop (synced at runtime)
+│   ├── agent-runner/
+│   │   ├── src/              # Agent loop (synced at runtime)
+│   │   └── tool-registry.json # Tool definitions, confirmation_required, default allowlist
 │   └── voice-service/        # FastAPI voice server
 ├── groups/
 │   ├── global/MISSION.md     # Shared memory
 │   └── {name}/
 │       ├── MISSION.md        # Group-specific memory
+│       ├── tools-enabled.json # Optional: allowed tool names for this group
 │       └── workflows/
 │           ├── registry.json
 │           └── *.sh
@@ -113,7 +114,8 @@ stingyclaw/
 │   └── auth/                 # WhatsApp session (host-only)
 ├── data/
 │   ├── sessions/             # Agent session history
-│   └── ipc/                  # File-based IPC
+│   └── ipc/
+│       └── {group}/          # File-based IPC; audit.jsonl = tool call audit
 ├── logs/
 ├── docker-compose.yml        # Voice service
 ├── MISSION.md                # Project context
@@ -210,14 +212,23 @@ Sessions are resumed on every new message to the group. They accumulate indefini
 
 ## Tools
 
-### Always Available (Built-In)
+### Tool registry and permissions
+
+All tools are defined in **`container/agent-runner/tool-registry.json`** (name, description, parameters, optional `confirmation_required` / `destructive`). The agent receives only **enabled** tools for that context:
+
+- **Main group**: all tools.
+- **Other groups**: `groups/<name>/tools-enabled.json` (JSON array of tool names), or the registry’s **default allowlist** (e.g. Read, Glob, Grep, WebFetch, send_*, ask_boss, list_workflows, search_tools, run_workflow, list_tasks, reset_session).
+
+Tools with **`confirmation_required`** (e.g. Bash, Write, Edit, register_group, run_workflow) trigger an ask_boss-style preview; the next user message is treated as confirm/cancel. **Audit**: every tool call is appended to `data/ipc/<group>/audit.jsonl` (ts, groupFolder, chatJid, tool, success, resultSizeBytes). See [MCP-ROADMAP.md](MCP-ROADMAP.md) for optional MCP exposure.
+
+### Tools (from registry)
 
 | Tool | Description |
 |------|-------------|
-| `Bash` | Run shell commands in container sandbox |
+| `Bash` | Run shell commands in container sandbox *(confirmation)* |
 | `Read` | Read file contents |
-| `Write` | Write file (create or overwrite) |
-| `Edit` | Replace string in file |
+| `Write` | Write file (create or overwrite) *(confirmation)* |
+| `Edit` | Replace string in file *(confirmation)* |
 | `Grep` | Search file contents (ripgrep) |
 | `Glob` | Find files by pattern |
 | `WebFetch` | Fetch URL, convert HTML to markdown |
@@ -226,9 +237,12 @@ Sessions are resumed on every new message to the group. They accumulate indefini
 | `send_voice` | Synthesize + send WhatsApp voice note |
 | `ask_boss` | Send message to user and wait for their reply |
 | `schedule_task` | Create/modify scheduled agent tasks |
+| `register_group` | Register new WhatsApp group (main only) *(confirmation)* |
+| `list_tasks` / `pause_task` / `resume_task` / `cancel_task` | Manage scheduled tasks |
+| `reset_session` | Clear conversation history for this chat |
 | `list_workflows` | List all registered automations |
 | `search_tools` | Semantic search over workflow registry |
-| `run_workflow` | Execute a workflow by name |
+| `run_workflow` | Execute a workflow by name *(confirmation)* |
 
 ### agent-browser Usage
 
@@ -339,6 +353,8 @@ Voice notes are transcribed locally by Whisper-small (CPU) via the voice service
 ```
 
 The agent is instructed to reply with `send_voice` when the user sent a voice note.
+
+**Call recordings**: Any audio message (voice note or audio file) is transcribed, not only PTT. So the user can send a recorded call and ask the agent to summarize it. The bot **cannot join live WhatsApp voice/video calls** — the platform has no API for that. The flow is: user records the call, sends the audio to the chat, then asks for a summary.
 
 ### Output (TTS)
 

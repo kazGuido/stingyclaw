@@ -13,13 +13,14 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendVoice: (jid: string, audioBuffer: Buffer) => Promise<void>;
+  sendImage: (jid: string, imageBuffer: Buffer, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   clearSession: (groupFolder: string) => void;
@@ -108,6 +109,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   }
                 } else {
                   logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC voice_message blocked');
+                }
+              } else if (data.type === 'image_message' && data.chatJid && data.relativePath) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+                  const groupDir = resolveGroupFolderPath(sourceGroup);
+                  const imagePath = path.join(groupDir, data.relativePath as string);
+                  const rel = path.relative(groupDir, path.resolve(groupDir, data.relativePath as string));
+                  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+                    logger.warn({ sourceGroup, relativePath: data.relativePath }, 'IPC image path escapes group folder, blocked');
+                  } else if (fs.existsSync(imagePath)) {
+                    const imageBuffer = fs.readFileSync(imagePath);
+                    if (deps.sendImage) {
+                      await deps.sendImage(data.chatJid, imageBuffer, data.caption as string | undefined);
+                      logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC image sent');
+                    } else {
+                      logger.warn({ chatJid: data.chatJid }, 'Channel does not support sendImage');
+                    }
+                  } else {
+                    logger.warn({ imagePath, sourceGroup }, 'IPC image file not found');
+                  }
+                } else {
+                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC image_message blocked');
                 }
               }
               fs.unlinkSync(filePath);

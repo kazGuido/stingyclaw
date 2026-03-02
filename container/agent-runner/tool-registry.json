@@ -1,0 +1,244 @@
+{
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Execute a bash command. Working directory: /workspace/group. Returns stdout + stderr.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "The bash command to execute" },
+          "timeout": { "type": "number", "description": "Timeout in ms (default 30000, max 120000)" }
+        },
+        "required": ["command"]
+      },
+      "confirmation_required": true,
+      "destructive": true
+    },
+    {
+      "name": "Read",
+      "description": "Read a file and return its contents with line numbers.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Absolute or relative (from /workspace/group) file path" },
+          "offset": { "type": "number", "description": "Start line number (1-indexed)" },
+          "limit": { "type": "number", "description": "Maximum lines to return" }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "Write",
+      "description": "Write content to a file (creates parent directories as needed).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Absolute or relative file path" },
+          "content": { "type": "string", "description": "Content to write" }
+        },
+        "required": ["path", "content"]
+      },
+      "confirmation_required": true,
+      "destructive": true
+    },
+    {
+      "name": "Edit",
+      "description": "Replace a specific string in a file. old_string must appear exactly once in the file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "File path" },
+          "old_string": { "type": "string", "description": "Exact text to replace (must be unique in the file)" },
+          "new_string": { "type": "string", "description": "Replacement text" }
+        },
+        "required": ["path", "old_string", "new_string"]
+      },
+      "confirmation_required": true,
+      "destructive": true
+    },
+    {
+      "name": "Glob",
+      "description": "Find files matching a glob pattern.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string", "description": "Glob pattern, e.g. \"**/*.ts\" or \"*.json\"" },
+          "directory": { "type": "string", "description": "Search root directory (default: /workspace/group)" }
+        },
+        "required": ["pattern"]
+      }
+    },
+    {
+      "name": "Grep",
+      "description": "Search file contents using ripgrep. Returns matching lines with file:line context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string", "description": "Regex or literal search pattern" },
+          "path": { "type": "string", "description": "File or directory to search (default: /workspace/group)" },
+          "flags": { "type": "string", "description": "Extra rg flags e.g. \"-i\" (case insensitive), \"-l\" (filenames only)" }
+        },
+        "required": ["pattern"]
+      }
+    },
+    {
+      "name": "WebFetch",
+      "description": "Fetch a URL and return its text content (HTML stripped).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "description": "URL to fetch" }
+        },
+        "required": ["url"]
+      }
+    },
+    {
+      "name": "send_message",
+      "description": "Send a WhatsApp text message to the chat right now (before finishing). Use for progress updates.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "Message text to send" }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "send_voice",
+      "description": "Send a WhatsApp voice note (spoken audio). Use for natural conversational replies, especially when the user sent a voice message. Keep text short — under ~200 words.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "Text to speak aloud as a voice note" },
+          "voice": { "type": "string", "description": "Optional speaker: Ryan, Aiden, Vivian, Serena, Uncle_Fu, Dylan, Eric, Ono_Anna, Sohee (default: Ryan)" }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "send_image",
+      "description": "Send an image to the WhatsApp chat (e.g. a screenshot). Use when the user wants to see a page, diagram, or any image. Path must be under /workspace/group (e.g. page.png or /workspace/group/page.png).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Path to the image file, e.g. page.png or /workspace/group/page.png" },
+          "caption": { "type": "string", "description": "Optional caption for the image" }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "ask_boss",
+      "description": "Ask the user (the boss) for guidance when stuck, unsure, or before doing something risky/irreversible. Your question is sent to the chat. Stop and wait for their reply — do not proceed until you have it. Use when: ambiguous request, destructive action, sensitive data, or you lack context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": { "type": "string", "description": "Clear question or context for the user to respond to" }
+        },
+        "required": ["question"]
+      }
+    },
+    {
+      "name": "schedule_task",
+      "description": "Schedule a recurring or one-time task that runs as an agent.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string", "description": "What the agent should do when the task runs" },
+          "schedule_type": { "type": "string", "enum": ["cron", "interval", "once"], "description": "cron=time-based, interval=every N ms, once=run once" },
+          "schedule_value": { "type": "string", "description": "cron: \"0 9 * * *\" | interval: ms like \"3600000\" | once: local ISO \"2026-02-01T15:30:00\" (no Z!)" },
+          "context_mode": { "type": "string", "enum": ["group", "isolated"], "description": "group=with chat history, isolated=fresh session (include context in prompt)" }
+        },
+        "required": ["prompt", "schedule_type", "schedule_value"]
+      }
+    },
+    {
+      "name": "register_group",
+      "description": "Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups.json (in /workspace/ipc/) to find the JID. When the user says they added you to a group, call this to activate it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "jid": { "type": "string", "description": "WhatsApp JID (e.g. \"120363336345536173@g.us\")" },
+          "name": { "type": "string", "description": "Display name for the group" },
+          "folder": { "type": "string", "description": "Folder name (lowercase, hyphens, e.g. \"family-chat\")" },
+          "trigger": { "type": "string", "description": "Trigger word (e.g. \"@Andy\")" },
+          "requiresTrigger": { "type": "boolean", "description": "If false, bot replies to all messages. Default true for groups." }
+        },
+        "required": ["jid", "name", "folder", "trigger"]
+      },
+      "confirmation_required": true
+    },
+    {
+      "name": "list_tasks",
+      "description": "List all scheduled tasks.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "pause_task",
+      "description": "Pause a scheduled task by ID.",
+      "parameters": {
+        "type": "object",
+        "properties": { "task_id": { "type": "string", "description": "Task ID to pause" } },
+        "required": ["task_id"]
+      }
+    },
+    {
+      "name": "resume_task",
+      "description": "Resume a paused scheduled task by ID.",
+      "parameters": {
+        "type": "object",
+        "properties": { "task_id": { "type": "string", "description": "Task ID to resume" } },
+        "required": ["task_id"]
+      }
+    },
+    {
+      "name": "cancel_task",
+      "description": "Cancel and delete a scheduled task by ID.",
+      "parameters": {
+        "type": "object",
+        "properties": { "task_id": { "type": "string", "description": "Task ID to cancel" } },
+        "required": ["task_id"]
+      }
+    },
+    {
+      "name": "reset_session",
+      "description": "Clear this chat's conversation history so the next message starts fresh. Use when the user asks to reset the session, clear memory, start over, or forget the conversation.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "list_workflows",
+      "description": "List all available workflows and automations in the registry. Call this when the user asks what you can do, what automations are available, or to browse capabilities.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "search_tools",
+      "description": "Search the workflow registry for tools/automations by keyword or intent. Returns matching entries with name, description, and how to run them. Call this first when the user asks you to do something that might be a pre-built workflow.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Keywords describing what you want to do, e.g. \"morning briefing\", \"send slack message\", \"fetch leads\"" }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "run_workflow",
+      "description": "Run a workflow by name from the registry. Optionally pass arguments as a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Workflow name from the registry" },
+          "args": { "type": "object", "description": "Optional key-value arguments passed as environment variables to the script", "additionalProperties": { "type": "string" } }
+        },
+        "required": ["name"]
+      },
+      "confirmation_required": true
+    }
+  ],
+  "defaultEnabledNonMain": [
+    "Read", "Glob", "Grep", "WebFetch",
+    "send_message", "send_voice", "send_image", "ask_boss",
+    "list_workflows", "search_tools", "run_workflow",
+    "list_tasks", "reset_session"
+  ]
+}

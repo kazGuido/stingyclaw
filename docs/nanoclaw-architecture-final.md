@@ -25,10 +25,10 @@ GroupQueue → spawns Docker container per group
     ▼
 Agent Container (nanoclaw-agent:latest)
     ├── Primary model: OpenRouter / Ollama
-    ├── Tool executor (Bash, Read, Write, Edit, Grep, Glob,
-    │   WebFetch, agent-browser, send_message, send_voice,
-    │   ask_boss, schedule_task, list_workflows, search_tools,
-    │   run_workflow)
+    ├── Tool registry (tool-registry.json) — single source of truth;
+    │   tools filtered by context (main = all; others = tools-enabled.json or default)
+    ├── Tool executor (Bash, Read, Write, …); confirmation_required → ask_boss preview
+    ├── Audit log → /workspace/ipc/audit.jsonl (who, when, tool, success, result size)
     └── Workflow registry (groups/*/workflows/registry.json)
     │
     ▼ IPC (file-based)
@@ -117,6 +117,15 @@ HTTP client for the voice service:
 
 The agent loop runs inside the container. It receives a JSON payload via stdin containing the message, session ID, group config, and secrets.
 
+### Tool registry and enabled tools
+
+- **Single source of truth**: `container/agent-runner/tool-registry.json` — every tool’s name, description, parameters, and optional `confirmation_required` / `destructive`.
+- **Filtering**: Only tools **enabled for this context** are sent to the model. **Main group**: all tools. **Other groups**: either `groups/<name>/tools-enabled.json` (JSON array of tool names) or the registry’s `defaultEnabledNonMain` list.
+- **Confirmation**: For tools with `confirmation_required`, the runner does not execute immediately; it sends an ask_boss-style preview to the user and treats the next message as yes/no before running.
+- **Audit**: Every tool call is appended to `/workspace/ipc/audit.jsonl` (ts, groupFolder, chatJid, tool, success, resultSizeBytes). On the host this is `data/ipc/<group>/audit.jsonl`.
+
+Optional MCP exposure of the same tools is described in [MCP-ROADMAP.md](MCP-ROADMAP.md).
+
 ### Backend Selection
 
 Priority order (first key found wins):
@@ -126,27 +135,27 @@ Priority order (first key found wins):
 ### Agent Loop
 
 ```
-1. Build system prompt (MISSION.md from group + global + agent capabilities)
-2. Load session (prior messages from .stingyclaw/sessions/{id}.json)
-3. Append new user message
-4. Loop:
-   a. Sanitize messages for Gemini compat (strip refusal:null, empty content)
-   b. Call model API (tools: auto)
-   c. If tool calls → execute tools → append results
-   d. If text response → stream to host via OUTPUT_START/END markers
-   e. If finish_reason=stop → break
-5. Save session
-6. Exit
+1. Load tool registry; build tool list for this context (getToolsForContext).
+2. Build system prompt (MISSION.md from group + global + agent capabilities).
+3. If session has pendingConfirmation and prompt is user reply → execute or cancel pending tool, then continue.
+4. Else append new user message.
+5. Loop:
+   a. Sanitize messages for API compat (strip refusal:null, empty content).
+   b. Call model API (tools: filtered list, tool_choice: auto).
+   c. If tool calls → for each: if confirmation_required → set pendingConfirmation, return confirmation_required to host; else execute, audit log, append results.
+   d. If text response → stream to host via OUTPUT_START/END markers.
+   e. If finish_reason=stop → break.
+6. Save session; exit (or wait for next IPC message if multi-turn).
 ```
 
 On 400 errors with many messages: auto-trims session to last 10 and retries once.
 
-### Tools
+### Tools (from registry)
 
 | Tool | Implementation |
 |------|---------------|
-| `Bash` | `child_process.execSync` inside container sandbox |
-| `Read` / `Write` / `Edit` | Direct filesystem ops in `/workspace/` |
+| `Bash` | `child_process.execSync` inside container sandbox *(confirmation_required)* |
+| `Read` / `Write` / `Edit` | Direct filesystem ops in `/workspace/` *(Write/Edit: confirmation_required)* |
 | `Grep` / `Glob` | `ripgrep` binary + `glob` package |
 | `WebFetch` | `fetch()` with HTML→markdown conversion |
 | `agent-browser` | Playwright-based Chromium CLI (`agent-browser` npm package) |
@@ -154,9 +163,12 @@ On 400 errors with many messages: auto-trims session to last 10 and retries once
 | `send_voice` | Writes JSON file to `/workspace/ipc/voice/` |
 | `ask_boss` | Sends message asking user, waits for reply via IPC input |
 | `schedule_task` | Writes JSON file to `/workspace/ipc/tasks/` |
+| `register_group` | Writes to IPC; main only *(confirmation_required)* |
+| `list_tasks` / `pause_task` / `resume_task` / `cancel_task` | IPC to host |
+| `reset_session` | Deletes session file; writes clear_session IPC |
 | `list_workflows` | Reads `registry.json` from group's workflows dir |
 | `search_tools` | Semantic search over registry using local `all-MiniLM-L6-v2` embeddings |
-| `run_workflow` | Executes shell script from registry, passes args as env vars |
+| `run_workflow` | Executes shell script from registry *(confirmation_required)* |
 
 ### Workflow Registry
 
@@ -270,10 +282,11 @@ data/
     {group}/
       .stingyclaw/
         sessions/
-          {uuid}.json     ← conversation history
+          {uuid}.json     ← conversation history (may include pendingConfirmation)
         transformers/     ← embedding model cache
   ipc/
     {group}/              ← IPC file exchange
+      audit.jsonl         ← tool call audit log (one JSON line per call)
 store/
   messages.db             ← SQLite: messages, groups, tasks, chats
   auth/                   ← WhatsApp session auth (never mounted into containers)

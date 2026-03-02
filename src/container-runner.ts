@@ -38,10 +38,14 @@ export interface ContainerInput {
 }
 
 export interface ContainerOutput {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'confirmation_required';
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** When status is confirmation_required: message to show user (ask_boss-style preview). */
+  confirmationPreview?: string;
+  /** When status is confirmation_required: tool name and args for logging. */
+  pendingTool?: { name: string; args: Record<string, unknown> };
 }
 
 interface VolumeMount {

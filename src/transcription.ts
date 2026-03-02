@@ -10,8 +10,14 @@ function getVoiceServiceUrl(): string {
   return (env.VOICE_SERVICE_URL ?? 'http://localhost:8001').replace(/\/$/, '');
 }
 
+/** True for PTT voice notes (short push-to-talk). */
 export function isVoiceMessage(msg: WAMessage): boolean {
   return msg.message?.audioMessage?.ptt === true;
+}
+
+/** True for any audio message (voice note or audio file). Used to transcribe call recordings etc. */
+export function isAudioMessage(msg: WAMessage): boolean {
+  return Boolean(msg.message?.audioMessage);
 }
 
 /**
