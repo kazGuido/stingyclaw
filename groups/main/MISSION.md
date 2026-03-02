@@ -82,31 +82,9 @@ Main has read-only access to the project and read-write access to its group fold
 
 ### Finding Available Groups
 
-Available groups are provided in `/workspace/ipc/available_groups.json`:
+Use the **`available_groups`** tool to get the list of WhatsApp groups (no confirmation needed). Groups are ordered by most recent activity.
 
-```json
-{
-  "groups": [
-    {
-      "jid": "120363336345536173@g.us",
-      "name": "Family Chat",
-      "lastActivity": "2026-01-31T12:00:00.000Z",
-      "isRegistered": false
-    }
-  ],
-  "lastSync": "2026-01-31T12:00:00.000Z"
-}
-```
-
-Groups are ordered by most recent activity. The list is synced from WhatsApp daily.
-
-If a group the user mentions isn't in the list, request a fresh sync:
-
-```bash
-echo '{"type": "refresh_groups"}' > /workspace/ipc/tasks/refresh_$(date +%s).json
-```
-
-Then wait a moment and re-read `available_groups.json`.
+If the list seems stale or the user says they added you to a new group, use **`refresh_groups`** (no confirmation needed), wait a moment, then call `available_groups` again.
 
 ### Registered Groups Config
 
@@ -144,8 +122,8 @@ Fields:
 **You MUST use the `register_group` tool.** Do NOT use Bash, Node, or any command to read or write the database. Registration is done only via the tool.
 
 If the user says they added you to a group (e.g. "did you see I added you to a group?" or "try again"):
-1. Read `/workspace/ipc/available_groups.json` (use Read tool or Bash `cat`) to find unregistered groups (`isRegistered: false`)
-2. If the list is empty or stale, request a refresh: write `{"type":"refresh_groups"}` to `/workspace/ipc/tasks/refresh_$(date +%s).json`, wait a moment, then re-read available_groups.json
+1. Call **`available_groups`** to find unregistered groups (`isRegistered: false`)
+2. If the list is empty or stale, call **`refresh_groups`**, wait a moment, then call `available_groups` again
 3. **Call the `register_group` tool** with the new group's jid, name, folder (e.g. slug from name), and trigger. Do not try to touch the database or project files.
 4. Confirm to the user that the group is now active
 
@@ -190,7 +168,7 @@ You cannot remove groups via tools. The user must do this manually (delete from 
 
 ### Listing Groups
 
-Read `/workspace/ipc/available_groups.json` to see available groups. For registered groups, the `register_group` tool maintains the state.
+Use `available_groups` to see available groups. For registered groups, the `register_group` tool maintains the state.
 
 ---
 
@@ -202,7 +180,7 @@ Read `/workspace/group/MISSION.md` for group-specific rules. There is no global 
 
 ## Scheduling for Other Groups
 
-When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `available_groups.json`:
+When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `available_groups`:
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.

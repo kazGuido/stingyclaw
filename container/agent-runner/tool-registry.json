@@ -153,8 +153,18 @@
       }
     },
     {
+      "name": "refresh_groups",
+      "description": "Request a refresh of WhatsApp group metadata. Main group only. Call this when the list in available_groups seems stale or the user says they added you to a new group. No confirmation needed.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "available_groups",
+      "description": "Return the list of WhatsApp groups (from /workspace/ipc/available_groups.json). Shows which groups are registered and which are not. Use to find JIDs for register_group. No confirmation needed.",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
       "name": "register_group",
-      "description": "Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups.json (in /workspace/ipc/) to find the JID. When the user says they added you to a group, call this to activate it.",
+      "description": "Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups to find the JID. When the user says they added you to a group, call this to activate it.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -276,6 +286,7 @@
     "send_message", "send_voice", "send_image", "ask_boss",
     "store_memory", "consult_memory", "submit_plan", "clear_plan",
     "list_workflows", "search_tools", "run_workflow",
-    "list_tasks", "reset_session"
+    "list_tasks", "reset_session",
+    "refresh_groups", "available_groups"
   ]
 }

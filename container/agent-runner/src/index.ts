@@ -692,6 +692,47 @@ async function executeTool(
         return 'Question sent. Stop and wait for the user\'s reply in the next message.';
       }
 
+      case 'refresh_groups': {
+        if (!input.isMain) {
+          return 'Only the main group can refresh group metadata.';
+        }
+        const groupsPath = path.join(IPC_DIR, 'available_groups.json');
+        let oldLastSync: string | null = null;
+        if (fs.existsSync(groupsPath)) {
+          try {
+            const prev = JSON.parse(fs.readFileSync(groupsPath, 'utf-8')) as { lastSync?: string };
+            oldLastSync = prev.lastSync ?? null;
+          } catch { /* ignore */ }
+        }
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'refresh_groups',
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        // Poll for host to process and write updated snapshot (up to ~10s)
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 500));
+          if (!fs.existsSync(groupsPath)) continue;
+          try {
+            const data = JSON.parse(fs.readFileSync(groupsPath, 'utf-8')) as { lastSync?: string; groups?: unknown[] };
+            const newLastSync = data.lastSync ?? null;
+            if (newLastSync && newLastSync !== oldLastSync) {
+              return JSON.stringify(data, null, 2);
+            }
+          } catch { /* retry */ }
+        }
+        return 'Refresh requested but host may still be syncing. Call available_groups again in a moment.';
+      }
+
+      case 'available_groups': {
+        const groupsPath = path.join(IPC_DIR, 'available_groups.json');
+        if (!fs.existsSync(groupsPath)) {
+          return 'available_groups.json not found. Try refresh_groups first (main group only).';
+        }
+        const content = fs.readFileSync(groupsPath, 'utf-8');
+        return content;
+      }
+
       case 'register_group': {
         if (!input.isMain) {
           return 'Only the main group can register new groups.';
