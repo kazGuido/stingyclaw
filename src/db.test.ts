@@ -7,6 +7,7 @@ import {
   getAllChats,
   getMessagesSince,
   getNewMessages,
+  getRecentMessages,
   getTaskById,
   storeChatMetadata,
   storeMessage,
@@ -175,6 +176,33 @@ describe('getMessagesSince', () => {
     });
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:04.000Z', 'Andy');
     expect(msgs).toHaveLength(0);
+  });
+});
+
+// --- getRecentMessages ---
+
+describe('getRecentMessages', () => {
+  beforeEach(() => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    store({ id: 'm1', chat_jid: 'group@g.us', sender: 'a@s.whatsapp.net', sender_name: 'Alice', content: 'first', timestamp: '2024-01-01T00:00:01.000Z' });
+    store({ id: 'm2', chat_jid: 'group@g.us', sender: 'b@s.whatsapp.net', sender_name: 'Bob', content: 'second', timestamp: '2024-01-01T00:00:02.000Z' });
+    storeMessage({ id: 'm3', chat_jid: 'group@g.us', sender: 'bot@s.whatsapp.net', sender_name: 'Bot', content: 'bot', timestamp: '2024-01-01T00:00:03.000Z', is_bot_message: true });
+    store({ id: 'm4', chat_jid: 'group@g.us', sender: 'a@s.whatsapp.net', sender_name: 'Alice', content: 'third', timestamp: '2024-01-01T00:00:04.000Z' });
+  });
+
+  it('returns recent messages in chronological order, excluding bot', () => {
+    const msgs = getRecentMessages('group@g.us', 10, 'Andy');
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0].content).toBe('first');
+    expect(msgs[1].content).toBe('second');
+    expect(msgs[2].content).toBe('third');
+  });
+
+  it('respects limit', () => {
+    const msgs = getRecentMessages('group@g.us', 2, 'Andy');
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content).toBe('second');
+    expect(msgs[1].content).toBe('third');
   });
 });
 

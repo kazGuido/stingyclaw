@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from './config.js';
+import { ASSISTANT_NAME, buildTriggerPattern, TRIGGER_PATTERN } from './config.js';
 import {
   escapeXml,
   formatMessages,
@@ -230,5 +230,11 @@ describe('trigger gating (requiresTrigger interaction)', () => {
   it('non-main group with requiresTrigger=false always processes (no trigger needed)', () => {
     const msgs = [makeMsg({ content: 'hello no trigger' })];
     expect(shouldProcess(false, false, msgs)).toBe(true);
+  });
+
+  it('group-specific trigger: @CustomBot matches when group has custom trigger', () => {
+    const customPattern = buildTriggerPattern('@CustomBot');
+    expect(customPattern.test('@CustomBot summarize the chat')).toBe(true);
+    expect(customPattern.test('@Andy do something')).toBe(false);
   });
 });

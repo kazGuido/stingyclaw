@@ -6,6 +6,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { synthesizeSpeech } from './transcription.js';
 
 import {
+  ASSISTANT_NAME,
   DATA_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
@@ -212,6 +213,9 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For read_messages
+    requestId?: string;
+    limit?: number;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -393,6 +397,54 @@ export async function processTaskIpc(
     case 'clear_session':
       deps.clearSession(sourceGroup);
       logger.info({ sourceGroup }, 'Session cleared via IPC');
+      break;
+
+    case 'read_messages':
+      if (data.requestId && data.chatJid) {
+        const targetJid = data.chatJid as string;
+        const targetGroup = registeredGroups[targetJid];
+        const canRead =
+          isMain ||
+          (targetGroup && targetGroup.folder === sourceGroup);
+        if (!canRead) {
+          logger.warn(
+            { sourceGroup, targetJid },
+            'Unauthorized read_messages attempt blocked',
+          );
+          break;
+        }
+        const limit = Math.min(Math.max(1, (data.limit as number) || 50), 200);
+        const messages = getRecentMessages(
+          targetJid,
+          limit,
+          ASSISTANT_NAME,
+        );
+        const responsesDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'responses',
+        );
+        fs.mkdirSync(responsesDir, { recursive: true });
+        const responsePath = path.join(
+          responsesDir,
+          `read_messages_${data.requestId}.json`,
+        );
+        fs.writeFileSync(
+          responsePath,
+          JSON.stringify({
+            messages: messages.map((m) => ({
+              sender: m.sender_name,
+              content: m.content,
+              timestamp: m.timestamp,
+            })),
+          }),
+          'utf-8',
+        );
+        logger.debug(
+          { sourceGroup, targetJid, count: messages.length },
+          'read_messages response written',
+        );
+      }
       break;
 
     case 'register_group':

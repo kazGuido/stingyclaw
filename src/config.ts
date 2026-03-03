@@ -63,6 +63,16 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+/**
+ * Build a trigger regex from a group-specific trigger string (e.g. "@CustomBot").
+ * Each group can have its own trigger; this is used instead of the global TRIGGER_PATTERN.
+ */
+export function buildTriggerPattern(trigger: string): RegExp {
+  const t = trigger.trim();
+  if (!t) return TRIGGER_PATTERN; // fallback to global
+  return new RegExp(`^${escapeRegex(t)}\\b`, 'i');
+}
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

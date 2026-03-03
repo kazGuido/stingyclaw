@@ -32,6 +32,7 @@ const IPC_DIR = '/workspace/ipc';
 const IPC_INPUT_DIR = `${IPC_DIR}/input`;
 const IPC_MESSAGES_DIR = `${IPC_DIR}/messages`;
 const IPC_TASKS_DIR = `${IPC_DIR}/tasks`;
+const IPC_RESPONSES_DIR = `${IPC_DIR}/responses`;
 const IPC_AUDIT_FILE = `${IPC_DIR}/audit.jsonl`;
 const IPC_INPUT_CLOSE_SENTINEL = `${IPC_INPUT_DIR}/_close`;
 const IPC_POLL_MS = 500;
@@ -179,9 +180,15 @@ interface Session {
 }
 
 function writeOutput(output: ContainerOutput): void {
-  console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
-  console.log(OUTPUT_END_MARKER);
+  const data =
+    OUTPUT_START_MARKER + '\n' + JSON.stringify(output) + '\n' + OUTPUT_END_MARKER + '\n';
+  // Write directly to fd to bypass Node.js block buffering when stdout is piped.
+  // Without this, the host never receives output until the container exits.
+  if (typeof process.stdout.fd === 'number') {
+    fs.writeSync(process.stdout.fd, data);
+  } else {
+    process.stdout.write(data);
+  }
 }
 
 function log(msg: string): void {
@@ -770,6 +777,39 @@ async function executeTool(
         }
         const content = fs.readFileSync(groupsPath, 'utf-8');
         return content;
+      }
+
+      case 'read_group_messages': {
+        const requestId = crypto.randomUUID();
+        const limit = Math.min(Math.max(1, (args.limit as number) || 50), 200);
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'read_messages',
+          requestId,
+          chatJid: input.chatJid,
+          limit,
+          groupFolder: input.groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `read_messages_${requestId}.json`);
+        for (let i = 0; i < 15; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              const msgs = data.messages || [];
+              if (msgs.length === 0) return 'No messages in this chat yet.';
+              return msgs
+                .map((m: { sender: string; content: string; timestamp: string }) =>
+                  `[${m.timestamp}] ${m.sender}: ${m.content}`,
+                )
+                .join('\n');
+            } catch {
+              return 'Error reading message history.';
+            }
+          }
+        }
+        return 'Message history request timed out. Try again.';
       }
 
       case 'register_group': {

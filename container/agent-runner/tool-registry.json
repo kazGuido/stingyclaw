@@ -162,6 +162,16 @@
       "parameters": { "type": "object", "properties": {} }
     },
     {
+      "name": "read_group_messages",
+      "description": "Read recent message history from the current group chat. Use when the user asks for a summary of the conversation, what was said, or to catch up on messages. Returns up to 50 messages by default.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "number", "description": "Max messages to return (default 50, max 200)" }
+        }
+      }
+    },
+    {
       "name": "register_group",
       "description": "Register a new WhatsApp group so the bot can respond there. Main group only. Use available_groups to find the JID. When the user says they added you to a group, call this to activate it.",
       "parameters": {
@@ -285,6 +295,6 @@
     "store_memory", "consult_memory", "memory_search", "submit_plan", "clear_plan",
     "list_workflows", "search_tools", "run_workflow",
     "list_tasks", "reset_session",
-    "refresh_groups", "available_groups"
+    "refresh_groups", "available_groups", "read_group_messages"
   ]
 }
