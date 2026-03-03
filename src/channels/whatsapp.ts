@@ -32,12 +32,17 @@ export interface WhatsAppChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
-// Backoff delays in ms: 2s, 5s, 15s, 30s, 60s, 60s, ...
-const RECONNECT_DELAYS = [2_000, 5_000, 15_000, 30_000, 60_000];
+// Backoff delays in ms: 2s, 5s, 15s, 30s, 60s, 120s, ...
+const RECONNECT_DELAYS = [2_000, 5_000, 15_000, 30_000, 60_000, 120_000];
 
-function reconnectDelay(attempt: number): number {
+// Conflict (440) = another client connected with same auth. Wait longer to avoid flip-flop.
+const CONFLICT_DELAY_MS = 120_000; // 2 min
+
+function reconnectDelay(attempt: number, reason?: number): number {
+  if (reason === 440) {
+    return CONFLICT_DELAY_MS + Math.floor(Math.random() * 30_000); // 2–2.5 min
+  }
   const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
-  // Add ±10% jitter so multiple instances don't all retry in sync
   return delay + Math.floor((Math.random() * 0.2 - 0.1) * delay);
 }
 
@@ -89,7 +94,7 @@ export class WhatsAppChannel implements Channel {
           'WhatsApp authentication required. Run: npx tsx setup/index.ts --step whatsapp-auth';
         logger.error(msg);
         exec(
-          `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
+          `osascript -e 'display notification "${msg}" with title "Stingyclaw" sound name "Basso"'`,
         );
         setTimeout(() => process.exit(1), 1000);
       }
@@ -98,23 +103,38 @@ export class WhatsAppChannel implements Channel {
         this.connected = false;
         const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
+        const isConflict = reason === 440;
+        if (isConflict) {
+          logger.warn(
+            { reason, attempt: this.reconnectAttempts },
+            'Connection replaced (440) — another client is using this WhatsApp session. Close WhatsApp Web elsewhere, or wait for reconnect.',
+          );
+        }
         logger.info({ reason, shouldReconnect, attempt: this.reconnectAttempts, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
 
-        // 405/408 = outdated version or rate limit — fetch new version and exit so systemd restarts
+        // 405/408 = outdated version or rate limit — refresh version and reconnect in-process
         if (reason === 405 || reason === 408) {
           const newVersion = await fetchAndPersistVersion();
           if (newVersion) {
-            logger.info({ version: newVersion }, 'Updated WhatsApp version due to 405; exiting for restart');
+            logger.info(
+              { reason, version: newVersion },
+              'Updated WhatsApp version after 405/408; continuing with in-process reconnect',
+            );
           } else {
-            logger.warn('405/408 but could not fetch new version; exiting anyway');
+            logger.warn(
+              { reason },
+              '405/408 but could not fetch latest version; continuing with in-process reconnect',
+            );
           }
-          process.exit(1);
         }
 
         if (shouldReconnect) {
-          const delay = reconnectDelay(this.reconnectAttempts);
+          const delay = reconnectDelay(this.reconnectAttempts, reason);
           this.reconnectAttempts++;
-          logger.info({ delayMs: delay, attempt: this.reconnectAttempts }, 'Reconnecting with backoff...');
+          logger.info({ delayMs: delay, attempt: this.reconnectAttempts, reason }, 'Reconnecting with backoff...');
+          try {
+            this.sock?.end(undefined);
+          } catch { /* ignore */ }
           setTimeout(() => {
             this.connectInternal().catch((err) => {
               logger.error({ err }, 'Reconnect attempt failed, will retry via next close event');

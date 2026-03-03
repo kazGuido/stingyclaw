@@ -4,7 +4,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 
-import { cleanup, createTempDir, initGitRepo, setupNanoclawDir } from './test-helpers.js';
+import { cleanup, createTempDir, initGitRepo, setupStingyclawDir } from './test-helpers.js';
 
 describe('update-core.ts CLI flags', () => {
   let tmpDir: string;
@@ -13,11 +13,11 @@ describe('update-core.ts CLI flags', () => {
 
   beforeEach(() => {
     tmpDir = createTempDir();
-    setupNanoclawDir(tmpDir);
+    setupStingyclawDir(tmpDir);
     initGitRepo(tmpDir);
 
     // Write state file
-    const statePath = path.join(tmpDir, '.nanoclaw', 'state.yaml');
+    const statePath = path.join(tmpDir, '.stingyclaw', 'state.yaml');
     fs.writeFileSync(
       statePath,
       stringify({
@@ -44,7 +44,7 @@ describe('update-core.ts CLI flags', () => {
   }
 
   it('--json --preview-only outputs JSON preview without applying', () => {
-    const baseDir = path.join(tmpDir, '.nanoclaw', 'base');
+    const baseDir = path.join(tmpDir, '.stingyclaw', 'base');
     fs.mkdirSync(path.join(baseDir, 'src'), { recursive: true });
     fs.writeFileSync(path.join(baseDir, 'src/index.ts'), 'original');
 

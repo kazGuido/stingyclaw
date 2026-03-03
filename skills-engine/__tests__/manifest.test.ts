@@ -11,7 +11,7 @@ import {
 } from '../manifest.js';
 import {
   createTempDir,
-  setupNanoclawDir,
+  setupStingyclawDir,
   createMinimalState,
   createSkillPackage,
   cleanup,
@@ -25,7 +25,7 @@ describe('manifest', () => {
 
   beforeEach(() => {
     tmpDir = createTempDir();
-    setupNanoclawDir(tmpDir);
+    setupStingyclawDir(tmpDir);
     createMinimalState(tmpDir);
     process.chdir(tmpDir);
   });

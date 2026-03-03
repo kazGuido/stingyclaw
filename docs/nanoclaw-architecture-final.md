@@ -23,7 +23,7 @@ Host polling loop (src/index.ts)
 GroupQueue → spawns Docker container per group
     │
     ▼
-Agent Container (nanoclaw-agent:latest)
+Agent Container (stingyclaw-agent:latest)
     ├── Primary model: OpenRouter / Ollama
     ├── Tool registry (tool-registry.json) — single source of truth;
     │   tools filtered by context (main = all; others = tools-enabled.json or default)
@@ -291,8 +291,8 @@ store/
   messages.db             ← SQLite: messages, groups, tasks, chats
   auth/                   ← WhatsApp session auth (never mounted into containers)
 logs/
-  nanoclaw.log
-  nanoclaw.error.log
+  stingyclaw.log
+  stingyclaw.error.log
 groups/
   {name}/
     MISSION.md
@@ -307,12 +307,12 @@ groups/
 
 | Image | Size | Purpose |
 |-------|------|---------|
-| `nanoclaw-agent:latest` | ~2.5GB | Agent runner (Node + ripgrep + Chromium + embedding model) |
+| `stingyclaw-agent:latest` | ~2.5GB | Agent runner (Node + ripgrep + Chromium + embedding model) |
 | `stingyclaw-voice:latest` | ~3GB | Voice service (LFM2.5-Audio-1.5B GGUF — handles ASR + TTS) |
 
 Agent image is rebuilt with:
 ```bash
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 ```
 
 Voice image:

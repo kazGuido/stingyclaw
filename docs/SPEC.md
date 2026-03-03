@@ -384,7 +384,7 @@ npx tsx setup/index.ts --step whatsapp-auth -- --method pairing-code --phone +XX
 
 ```bash
 npm run build
-node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+node dist/index.js >> logs/stingyclaw.log 2>> logs/stingyclaw.error.log &
 ```
 
 ### Updating Agent Code
@@ -393,7 +393,7 @@ The agent-runner source (`container/agent-runner/src/`) is synced to the contain
 
 For Dockerfile changes (new packages, system deps):
 ```bash
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 ```
 
 For voice service changes:

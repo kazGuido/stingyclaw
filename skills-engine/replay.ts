@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { BASE_DIR, NANOCLAW_DIR } from './constants.js';
+import { BASE_DIR, STINGYCLAW_DIR } from './constants.js';
 import { copyDir } from './fs-utils.js';
 import { readManifest } from './manifest.js';
 import {

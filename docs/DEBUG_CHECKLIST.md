@@ -4,22 +4,22 @@
 
 ```bash
 # 1. Is the host process running?
-pgrep -a -f 'nanoclaw/dist/index.js'
+pgrep -a -f 'stingyclaw/dist/index.js'
 
 # 2. Any running agent containers?
-docker ps --format '{{.Names}} {{.Status}}' | grep nanoclaw
+docker ps --format '{{.Names}} {{.Status}}' | grep stingyclaw
 
 # 3. Is the voice service running?
 docker ps --format '{{.Names}} {{.Status}}' | grep stingyclaw-voice
 
 # 4. Recent errors?
-grep -E 'ERROR|WARN|Fatal' logs/nanoclaw.log | tail -20
+grep -E 'ERROR|WARN|Fatal' logs/stingyclaw.log | tail -20
 
 # 5. Is WhatsApp connected?
-grep -E 'Connected|Connection closed|Connecting' logs/nanoclaw.log | tail -5
+grep -E 'Connected|Connection closed|Connecting' logs/stingyclaw.log | tail -5
 
 # 6. Are groups loaded?
-grep 'Group registered' logs/nanoclaw.log | tail -5
+grep 'Group registered' logs/stingyclaw.log | tail -5
 ```
 
 ---
@@ -28,13 +28,13 @@ grep 'Group registered' logs/nanoclaw.log | tail -5
 
 ```bash
 # Check if messages are being received
-grep 'New messages\|Processing messages' logs/nanoclaw.log | tail -10
+grep 'New messages\|Processing messages' logs/stingyclaw.log | tail -10
 
 # Check if container was spawned
-grep 'Spawning container' logs/nanoclaw.log | tail -5
+grep 'Spawning container' logs/stingyclaw.log | tail -5
 
 # Check if agent errored and retries are happening
-grep -E 'Container agent error|Scheduling retry|Max retries exceeded' logs/nanoclaw.log | tail -10
+grep -E 'Container agent error|Scheduling retry|Max retries exceeded' logs/stingyclaw.log | tail -10
 
 # Check the most recent container log
 ls -lt groups/main/logs/container-*.log | head -3
@@ -54,15 +54,15 @@ docker events --since 10m --filter event=die --filter event=start \
   --format "{{.Time}} {{.Actor.Attributes.name}} {{.Action}}" 2>/dev/null
 
 # Get logs from a specific container (it exits fast — catch it)
-docker ps -a --format '{{.Names}} {{.Status}}' | grep nanoclaw
+docker ps -a --format '{{.Names}} {{.Status}}' | grep stingyclaw
 
 # Test run the agent image manually with dummy input
 echo '{"group":"main","message":"test","history":[]}' | docker run --rm -i \
   -e OPENROUTER_API_KEY=test \
-  nanoclaw-agent:latest 2>&1 | head -20
+  stingyclaw-agent:latest 2>&1 | head -20
 
 # Check image build date vs last code change
-docker inspect nanoclaw-agent:latest --format '{{.Created}}'
+docker inspect stingyclaw-agent:latest --format '{{.Created}}'
 ls -la container/agent-runner/src/index.ts container/agent-runner/tool-registry.json
 # Last tool calls (audit log): tail -20 data/ipc/main/audit.jsonl
 ```
@@ -104,7 +104,7 @@ curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
   -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" | python3 -m json.tool
 
 # Check what model and backend the agent is using
-grep 'Backend:' logs/nanoclaw.log | tail -5
+grep 'Backend:' logs/stingyclaw.log | tail -5
 
 # Corrupt session causing 400? Reset it:
 SESSION_FILE=$(find data/sessions -name "*.json" | head -1)
@@ -140,7 +140,7 @@ python3 -c "import json; s=json.load(open('$SESSION')); s['messages']=[]; json.d
 
 ```bash
 # Check if auth expired (QR requested)
-grep -E 'QR|authentication|pairing' logs/nanoclaw.log | tail -5
+grep -E 'QR|authentication|pairing' logs/stingyclaw.log | tail -5
 
 # Check auth files exist
 ls -la store/auth/
@@ -155,23 +155,23 @@ npx tsx setup/index.ts --step whatsapp-auth -- --method pairing-code --phone +XX
 
 ```bash
 # Restart the host process
-HOST_PID=$(pgrep -f 'nanoclaw/dist/index.js')
+HOST_PID=$(pgrep -f 'stingyclaw/dist/index.js')
 kill $HOST_PID
 sleep 2
-nohup node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+nohup node dist/index.js >> logs/stingyclaw.log 2>> logs/stingyclaw.error.log &
 
 # Rebuild after code changes and restart
 npm run build
-kill $(pgrep -f 'nanoclaw/dist/index.js')
-nohup node dist/index.js >> logs/nanoclaw.log 2>> logs/nanoclaw.error.log &
+kill $(pgrep -f 'stingyclaw/dist/index.js')
+nohup node dist/index.js >> logs/stingyclaw.log 2>> logs/stingyclaw.error.log &
 
 # Rebuild agent container image
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 # (the agent-runner/src is mounted at runtime — just restart host for code changes there)
 
 # View live logs
-tail -f logs/nanoclaw.log
-tail -f logs/nanoclaw.error.log
+tail -f logs/stingyclaw.log
+tail -f logs/stingyclaw.error.log
 ```
 
 ---

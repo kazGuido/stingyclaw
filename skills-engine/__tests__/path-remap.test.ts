@@ -8,7 +8,7 @@ import {
   cleanup,
   createMinimalState,
   createTempDir,
-  setupNanoclawDir,
+  setupStingyclawDir,
 } from './test-helpers.js';
 
 describe('path-remap', () => {
@@ -17,7 +17,7 @@ describe('path-remap', () => {
 
   beforeEach(() => {
     tmpDir = createTempDir();
-    setupNanoclawDir(tmpDir);
+    setupStingyclawDir(tmpDir);
     createMinimalState(tmpDir);
     process.chdir(tmpDir);
   });
@@ -49,7 +49,7 @@ describe('path-remap', () => {
 
     it('ignores remap target that resolves through symlink outside project root', () => {
       const outsideDir = fs.mkdtempSync(
-        path.join(path.dirname(tmpDir), 'nanoclaw-remap-outside-'),
+        path.join(path.dirname(tmpDir), 'stingyclaw-remap-outside-'),
       );
       const linkPath = path.join(tmpDir, 'link-out');
 
@@ -106,7 +106,7 @@ describe('path-remap', () => {
 
     it('drops symlink-based escape entries stored in state', () => {
       const outsideDir = fs.mkdtempSync(
-        path.join(path.dirname(tmpDir), 'nanoclaw-remap-outside-'),
+        path.join(path.dirname(tmpDir), 'stingyclaw-remap-outside-'),
       );
       const linkPath = path.join(tmpDir, 'link-out');
 

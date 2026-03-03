@@ -25,8 +25,8 @@ const execAsync = promisify(exec);
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const OUTPUT_START_MARKER = '---STINGYCLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---STINGYCLAW_OUTPUT_END---';
 
 const IPC_DIR = '/workspace/ipc';
 const IPC_INPUT_DIR = `${IPC_DIR}/input`;
@@ -213,6 +213,7 @@ function saveSession(session: Session): void {
 interface MemoryEntry {
   t: string;
   content: string;
+  embedding?: number[];
 }
 
 function loadMemoryFile(): MemoryEntry[] {
@@ -242,6 +243,39 @@ function appendStoredMemory(content: string): void {
   const trimmed = entries.slice(-AGENT_MEMORY_MAX_ENTRIES);
   fs.mkdirSync(path.dirname(AGENT_MEMORY_PATH), { recursive: true });
   fs.writeFileSync(AGENT_MEMORY_PATH, JSON.stringify({ entries: trimmed }, null, 2));
+}
+
+/** Append memory with embedding for semantic search. Compaction: drop oldest when over limit. */
+async function appendStoredMemoryWithEmbedding(content: string): Promise<void> {
+  const entries = loadMemoryFile();
+  const text = content.slice(0, 2000);
+  const [vec] = await embed([text]);
+  entries.push({ t: new Date().toISOString(), content: text, embedding: vec });
+  // Compaction: keep last N entries
+  const trimmed = entries.slice(-AGENT_MEMORY_MAX_ENTRIES);
+  fs.mkdirSync(path.dirname(AGENT_MEMORY_PATH), { recursive: true });
+  fs.writeFileSync(AGENT_MEMORY_PATH, JSON.stringify({ entries: trimmed }, null, 2));
+}
+
+/** Semantic search over stored memory. Returns top-k most relevant entries. */
+async function memorySearch(query: string, topK = 5): Promise<MemoryEntry[]> {
+  const entries = loadMemoryFile();
+  if (entries.length === 0) return [];
+  const withoutEmbedding = entries.filter(e => !e.embedding || e.embedding.length === 0);
+  if (withoutEmbedding.length > 0) {
+    const vecs = await embed(withoutEmbedding.map(e => e.content));
+    for (let i = 0; i < withoutEmbedding.length; i++) {
+      withoutEmbedding[i].embedding = vecs[i];
+    }
+    fs.writeFileSync(AGENT_MEMORY_PATH, JSON.stringify({ entries }, null, 2));
+  }
+  const [queryVec] = await embed([query]);
+  const scored = entries
+    .filter((e): e is MemoryEntry & { embedding: number[] } => !!(e.embedding?.length))
+    .map(e => ({ entry: e, score: cosine(queryVec, e.embedding) }))
+    .filter(s => s.score > 0.2)
+    .sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK).map(s => s.entry);
 }
 
 // ─── Current plan (plan → execute → summarize) ─────────────────────────────────
@@ -358,7 +392,7 @@ Tell the boss — when stuck or unsure:
 
   const memoryContent = getMemoryForPrompt();
   if (memoryContent) {
-    parts.push('\n\n---\nStored memory (context across turns; use consult_memory to read, store_memory to update):\n' + memoryContent);
+    parts.push('\n\n---\nStored memory (context across turns; use consult_memory to read, store_memory to update, memory_search to find by meaning):\n' + memoryContent);
   }
 
   const planContent = getPlanForPrompt();
@@ -624,7 +658,7 @@ async function executeTool(
         const url = args.url as string;
         log(`WebFetch: ${url}`);
         const res = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NanoClaw/2.0)' },
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Stingyclaw/2.0)' },
           signal: AbortSignal.timeout(30000),
         });
         const text = await res.text();
@@ -870,13 +904,22 @@ async function executeTool(
       case 'store_memory': {
         const content = (args.content as string) || '';
         if (!content.trim()) return 'No content to store.';
-        appendStoredMemory(content.trim());
+        await appendStoredMemoryWithEmbedding(content.trim());
         return 'Stored. It will be available in your context on the next turn.';
       }
 
       case 'consult_memory': {
         const content = getMemoryForPrompt();
         return content || '(No stored memory yet. Use store_memory to save summaries or facts.)';
+      }
+
+      case 'memory_search': {
+        const query = (args.query as string) || '';
+        if (!query.trim()) return 'Provide a query to search for.';
+        const topK = Math.min(10, Math.max(1, (args.top_k as number) || 5));
+        const matches = await memorySearch(query.trim(), topK);
+        if (!matches.length) return `No stored memory matched "${query}".`;
+        return matches.map(e => `[${e.t}] ${e.content}`).join('\n\n');
       }
 
       case 'submit_plan': {

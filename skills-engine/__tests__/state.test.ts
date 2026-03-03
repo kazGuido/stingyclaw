@@ -12,7 +12,7 @@ import {
 } from '../state.js';
 import {
   createTempDir,
-  setupNanoclawDir,
+  setupStingyclawDir,
   createMinimalState,
   writeState as writeStateHelper,
   cleanup,
@@ -24,7 +24,7 @@ describe('state', () => {
 
   beforeEach(() => {
     tmpDir = createTempDir();
-    setupNanoclawDir(tmpDir);
+    setupStingyclawDir(tmpDir);
     process.chdir(tmpDir);
   });
 

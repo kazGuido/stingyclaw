@@ -249,7 +249,7 @@ groups/main/
 git fetch upstream
 git merge upstream/main
 # 主要冲突点：container/agent-runner/src/index.ts 和 src/channels/whatsapp.ts
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 docker compose build voice
 ```
 

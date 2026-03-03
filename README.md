@@ -266,7 +266,7 @@ The current build is a solid foundation. Architecture is aligned around a **tool
 git fetch upstream
 git merge upstream/main
 # Resolve conflicts in container/agent-runner/src/index.ts and src/channels/whatsapp.ts
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 docker compose build voice
 ```
 

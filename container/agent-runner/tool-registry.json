@@ -282,7 +282,7 @@
   "defaultEnabledNonMain": [
     "Read", "Glob", "Grep", "WebFetch",
     "send_message", "send_voice", "send_image", "ask_boss",
-    "store_memory", "consult_memory", "submit_plan", "clear_plan",
+    "store_memory", "consult_memory", "memory_search", "submit_plan", "clear_plan",
     "list_workflows", "search_tools", "run_workflow",
     "list_tasks", "reset_session",
     "refresh_groups", "available_groups"

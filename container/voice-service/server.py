@@ -13,6 +13,7 @@ Tunables (env vars):
   TTS_TOP_P       Nucleus sampling (default: 0.95)
 """
 
+import asyncio
 import os
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.95"))
 TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
 
 app = FastAPI(title="Stingyclaw Voice — LFM2.5-Audio GGUF")
+CLI_LOCK = asyncio.Lock()
 
 
 def _cli_args():
@@ -81,12 +83,15 @@ async def transcribe(audio: UploadFile = File(...)):
 
         cmd = _cli_args() + ["-sys", "Perform ASR.", "--audio", str(wav_path)]
         try:
-            out = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=120,
-                cwd=str(MODELS_DIR),
-            )
+            # The GGUF runner is memory-heavy; serialize invocations to avoid transient
+            # failures when ASR/TTS requests overlap under load.
+            async with CLI_LOCK:
+                out = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=120,
+                    cwd=str(MODELS_DIR),
+                )
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "Transcription timed out")
         except FileNotFoundError:
@@ -122,12 +127,15 @@ async def synthesize(req: SynthRequest):
             "--top-p", str(TTS_TOP_P),
         ]
         try:
-            out = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=120,
-                cwd=str(MODELS_DIR),
-            )
+            # The GGUF runner is memory-heavy; serialize invocations to avoid transient
+            # failures when ASR/TTS requests overlap under load.
+            async with CLI_LOCK:
+                out = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=120,
+                    cwd=str(MODELS_DIR),
+                )
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "Synthesis timed out")
         except FileNotFoundError:

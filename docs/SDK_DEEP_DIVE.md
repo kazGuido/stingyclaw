@@ -220,9 +220,9 @@ On each container start, the session ID is passed in the input payload. The agen
 Results are sent to the host via stdout using delimited markers:
 
 ```
----NANOCLAW_OUTPUT_START---
+---STINGYCLAW_OUTPUT_START---
 {"status":"success","result":"The weather today is...","newSessionId":"..."}
----NANOCLAW_OUTPUT_END---
+---STINGYCLAW_OUTPUT_END---
 ```
 
 The host reads stdout line by line, buffers between markers, and parses the JSON. For streaming, the agent can write multiple OUTPUT_START/END blocks during a single run (e.g., one per tool result if progressive output is enabled).
@@ -234,9 +234,9 @@ The host reads stdout line by line, buffers between markers, and parses the JSON
 All fatal errors write an error output block and exit with code 1:
 
 ```
----NANOCLAW_OUTPUT_START---
+---STINGYCLAW_OUTPUT_START---
 {"status":"error","result":null,"error":"401 Missing Authentication header"}
----NANOCLAW_OUTPUT_END---
+---STINGYCLAW_OUTPUT_END---
 ```
 
 The host interprets exit code 1 as failure and schedules a retry with exponential backoff. After `MAX_RETRIES` (5), it sends a WhatsApp error notification and stops retrying until the next incoming message.

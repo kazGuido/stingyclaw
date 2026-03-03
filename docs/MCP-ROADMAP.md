@@ -1,4 +1,4 @@
-# MCP roadmap for NanoClaw tools
+# MCP roadmap for Stingyclaw tools
 
 Tools are implemented **inline** in the agent-runner today and are the single source of execution. This doc describes how we can add **MCP (Model Context Protocol)** later so the same tools can be exposed to MCP clients without rewriting everything.
 

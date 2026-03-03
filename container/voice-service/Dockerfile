@@ -14,13 +14,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY download-gguf.sh server.py ./
-RUN chmod +x download-gguf.sh
+COPY download-gguf.sh warmup.sh server.py ./
+RUN chmod +x download-gguf.sh warmup.sh
 
 VOLUME ["/models"]
 ENV MODELS_DIR=/models
 
 EXPOSE 8001
 
-# Download model on first run, then start server
-ENTRYPOINT ["/bin/sh", "-c", "MODELS_DIR=/models /app/download-gguf.sh && exec uvicorn server:app --host 0.0.0.0 --port 8001 --workers 1"]
+# Download model on first run, warm up (pre-load model), then start server
+ENTRYPOINT ["/bin/sh", "-c", "MODELS_DIR=/models /app/download-gguf.sh && /app/warmup.sh 2>/dev/null || true && exec uvicorn server:app --host 0.0.0.0 --port 8001 --workers 1"]

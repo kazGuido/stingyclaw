@@ -1,15 +1,15 @@
-# NanoClaw — Agent Rules
+# Stingyclaw — Agent Rules
 
 Follow these rules when working on this project.
 
 ## GitHub setup (one-time)
 
-This repo was forked from `qwibitai/nanoclaw`. To point it at your own GitHub:
+This repo was forked from `qwibitai/stingyclaw`. To point it at your own GitHub:
 
 ```bash
-# 1. Create a new repo on github.com (e.g. yourname/nanoclaw), then:
-git remote set-url origin https://github.com/YOURNAME/nanoclaw.git
-git remote add upstream https://github.com/qwibitai/nanoclaw.git
+# 1. Create a new repo on github.com (e.g. yourname/stingyclaw), then:
+git remote set-url origin https://github.com/YOURNAME/stingyclaw.git
+git remote add upstream https://github.com/qwibitai/stingyclaw.git
 git push -u origin main
 
 # Pull upstream improvements later with:
@@ -82,31 +82,31 @@ The agent runs inside a Docker container. Rebuild the image whenever you change
 anything inside `container/` (Dockerfile, agent-runner source, etc.):
 
 ```bash
-cd /home/admin_user/nanoclaw
-docker build -t nanoclaw-agent:latest -f container/Dockerfile container/
+cd /home/admin_user/stingyclaw
+docker build -t stingyclaw-agent:latest -f container/Dockerfile container/
 ```
 
 Verify the build:
 ```bash
 # Should print 401 auth error (correct — it reached OpenRouter)
 echo '{"prompt":"hi","groupFolder":"test","chatJid":"test@s.whatsapp.net","isMain":false,"secrets":{"OPENROUTER_API_KEY":"no-key"}}' \
-  | docker run --rm -i nanoclaw-agent:latest 2>&1 | tail -5
+  | docker run --rm -i stingyclaw-agent:latest 2>&1 | tail -5
 ```
 
 ## Service management
 
 ```bash
 # Start
-systemctl --user start nanoclaw
+systemctl --user start stingyclaw
 
 # Stop
-systemctl --user stop nanoclaw
+systemctl --user stop stingyclaw
 
 # Restart (after code changes to src/)
-npm run build && systemctl --user restart nanoclaw
+npm run build && systemctl --user restart stingyclaw
 
 # Logs (live)
-tail -f logs/nanoclaw.log
+tail -f logs/stingyclaw.log
 
 # Full setup wizard
 npx tsx setup/index.ts --step <name>

@@ -53,7 +53,7 @@ async function runMatrixEntry(
     });
 
     // Initialize nanoclaw dir
-    execSync('npx tsx -e "import { initNanoclawDir } from \'./skills-engine/index.js\'; initNanoclawDir();"', {
+    execSync('npx tsx -e "import { initStingyclawDir } from \'./skills-engine/index.js\'; initStingyclawDir();"', {
       cwd: tmpDir,
       stdio: 'pipe',
       timeout: 30_000,

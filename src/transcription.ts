@@ -5,6 +5,10 @@ import { WAMessage, WASocket, downloadMediaMessage } from '@whiskeysockets/baile
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getVoiceServiceUrl(): string {
   const env = readEnvFile(['VOICE_SERVICE_URL']);
   return (env.VOICE_SERVICE_URL ?? 'http://localhost:8001').replace(/\/$/, '');
@@ -101,25 +105,43 @@ export async function synthesizeSpeech(
 ): Promise<Buffer | null> {
   const baseUrl = getVoiceServiceUrl();
 
-  try {
-    const res = await fetch(`${baseUrl}/synthesize`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice }),
-      signal: AbortSignal.timeout(60000),
-    });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${baseUrl}/synthesize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice }),
+        signal: AbortSignal.timeout(60000),
+      });
 
-    if (!res.ok) {
-      const body = await res.text();
-      logger.error({ status: res.status, body }, 'Voice service synthesis error');
+      if (!res.ok) {
+        const body = await res.text();
+        const retryable = res.status >= 500 || res.status === 429;
+        const isModelLoad = body.includes('llama_model_loader') || body.includes('load_backend');
+        logger.error(
+          { status: res.status, body: body.slice(0, 300), attempt, retryable, isModelLoad },
+          'Voice service synthesis error',
+        );
+        if (retryable && attempt < 3) {
+          const delay = isModelLoad ? 5000 : 1500;
+          logger.info({ attempt, delayMs: delay }, 'Retrying voice synthesis...');
+          await sleep(delay);
+          continue;
+        }
+        return null;
+      }
+
+      const bytes = Buffer.from(await res.arrayBuffer());
+      logger.info({ chars: text.length, bytes: bytes.length }, 'Synthesized speech');
+      return bytes;
+    } catch (err) {
+      logger.error({ err, attempt }, 'Failed to call voice service for synthesis');
+      if (attempt < 3) {
+        await sleep(attempt === 1 ? 3000 : 5000);
+        continue;
+      }
       return null;
     }
-
-    const bytes = Buffer.from(await res.arrayBuffer());
-    logger.info({ chars: text.length, bytes: bytes.length }, 'Synthesized speech');
-    return bytes;
-  } catch (err) {
-    logger.error({ err }, 'Failed to call voice service for synthesis');
-    return null;
   }
+  return null;
 }

@@ -15,7 +15,7 @@ function generatePlist(nodePath: string, projectRoot: string, homeDir: string): 
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nanoclaw</string>
+    <string>com.stingyclaw</string>
     <key>ProgramArguments</key>
     <array>
         <string>${nodePath}</string>
@@ -37,7 +37,7 @@ function generatePlist(nodePath: string, projectRoot: string, homeDir: string): 
     <key>StandardOutPath</key>
     <string>${projectRoot}/logs/nanoclaw.log</string>
     <key>StandardErrorPath</key>
-    <string>${projectRoot}/logs/nanoclaw.error.log</string>
+    <string>${projectRoot}/logs/stingyclaw.error.log</string>
 </dict>
 </plist>`;
 }
@@ -49,7 +49,7 @@ function generateSystemdUnit(
   isSystem: boolean,
 ): string {
   return `[Unit]
-Description=NanoClaw Personal Assistant
+Description=Stingyclaw Personal Assistant
 After=network.target
 
 [Service]
@@ -61,7 +61,7 @@ RestartSec=5
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
+StandardError=append:${projectRoot}/logs/stingyclaw.error.log
 
 [Install]
 WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
@@ -70,7 +70,7 @@ WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 describe('plist generation', () => {
   it('contains the correct label', () => {
     const plist = generatePlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
-    expect(plist).toContain('<string>com.nanoclaw</string>');
+    expect(plist).toContain('<string>com.stingyclaw</string>');
   });
 
   it('uses the correct node path', () => {
@@ -86,7 +86,7 @@ describe('plist generation', () => {
   it('sets log paths', () => {
     const plist = generatePlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
     expect(plist).toContain('nanoclaw.log');
-    expect(plist).toContain('nanoclaw.error.log');
+    expect(plist).toContain('stingyclaw.error.log');
   });
 });
 
@@ -123,7 +123,7 @@ describe('WSL nohup fallback', () => {
     const wrapper = `#!/bin/bash
 set -euo pipefail
 cd ${JSON.stringify(projectRoot)}
-nohup ${JSON.stringify(nodePath)} ${JSON.stringify(projectRoot)}/dist/index.js >> ${JSON.stringify(projectRoot)}/logs/nanoclaw.log 2>> ${JSON.stringify(projectRoot)}/logs/nanoclaw.error.log &
+nohup ${JSON.stringify(nodePath)} ${JSON.stringify(projectRoot)}/dist/index.js >> ${JSON.stringify(projectRoot)}/logs/nanoclaw.log 2>> ${JSON.stringify(projectRoot)}/logs/stingyclaw.error.log &
 echo $! > ${JSON.stringify(pidFile)}`;
 
     expect(wrapper).toContain('#!/bin/bash');

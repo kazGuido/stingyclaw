@@ -3,9 +3,9 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
-  POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
@@ -101,6 +101,49 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     { jid, name: group.name, folder: group.folder },
     'Group registered',
   );
+}
+
+/**
+ * Handle new messages for a group (event-driven path).
+ * Either pipes to active container or enqueues for processing.
+ */
+function handleNewMessagesForGroup(chatJid: string): void {
+  const group = registeredGroups[chatJid];
+  if (!group) return;
+
+  const channel = findChannel(channels, chatJid);
+  if (!channel) {
+    logger.warn({ chatJid }, 'No channel owns JID, skipping');
+    return;
+  }
+
+  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+
+  const allPending = getMessagesSince(
+    chatJid,
+    lastAgentTimestamp[chatJid] || '',
+    ASSISTANT_NAME,
+  );
+  if (allPending.length === 0) return;
+
+  if (needsTrigger) {
+    const hasTrigger = allPending.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+    if (!hasTrigger) return;
+  }
+
+  const formatted = formatMessages(allPending);
+
+  if (queue.sendMessage(chatJid, formatted)) {
+    logger.debug({ chatJid, count: allPending.length }, 'Piped messages to active container');
+    lastAgentTimestamp[chatJid] = allPending[allPending.length - 1].timestamp;
+    saveState();
+    channel.setTyping?.(chatJid, true)?.catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+    );
+  } else {
+    queue.enqueueMessageCheck(chatJid);
+  }
 }
 
 /**
@@ -341,7 +384,7 @@ async function startMessageLoop(): Promise<void> {
   }
   messageLoopRunning = true;
 
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
+  logger.info(`Stingyclaw running (trigger: @${ASSISTANT_NAME}) — event-driven, safety poll every 30s`);
 
   while (true) {
     try {
@@ -349,79 +392,20 @@ async function startMessageLoop(): Promise<void> {
       const { messages, newTimestamp } = getNewMessages(jids, lastTimestamp, ASSISTANT_NAME);
 
       if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
+        logger.info({ count: messages.length }, 'Safety poll: new messages');
         lastTimestamp = newTimestamp;
         saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        const seenGroups = new Set<string>();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-            continue;
-          }
-
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel.setTyping?.(chatJid, true)?.catch((err) =>
-              logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-            );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
+          if (seenGroups.has(msg.chat_jid)) continue;
+          seenGroups.add(msg.chat_jid);
+          handleNewMessagesForGroup(msg.chat_jid);
         }
       }
     } catch (err) {
-      logger.error({ err }, 'Error in message loop');
+      logger.error({ err }, 'Error in safety poll loop');
     }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+    await new Promise((resolve) => setTimeout(resolve, 30_000));
   }
 }
 
@@ -448,7 +432,38 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+const LOCK_FILE = path.join(DATA_DIR, '.nanoclaw.lock');
+
+function acquireProcessLock(): boolean {
+  try {
+    fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
+    const pid = process.pid.toString();
+    if (fs.existsSync(LOCK_FILE)) {
+      const existing = fs.readFileSync(LOCK_FILE, 'utf-8').trim();
+      const existingPid = parseInt(existing, 10);
+      if (!Number.isNaN(existingPid)) {
+        try {
+          process.kill(existingPid, 0);
+          logger.warn({ existingPid }, 'Another stingyclaw instance appears to be running (lock file exists). Exiting.');
+          return false;
+        } catch {
+          /* process not running, we can take the lock */
+        }
+      }
+    }
+    fs.writeFileSync(LOCK_FILE, pid);
+    process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ } });
+    return true;
+  } catch (err) {
+    logger.warn({ err }, 'Could not acquire process lock, continuing anyway');
+    return true;
+  }
+}
+
 async function main(): Promise<void> {
+  if (!acquireProcessLock()) {
+    process.exit(1);
+  }
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
@@ -465,8 +480,13 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   // Channel callbacks (shared by all channels)
+  // Event-driven: store message and immediately trigger processing for registered groups
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
+    onMessage: (chatJid: string, msg: NewMessage) => {
+      storeMessage(msg);
+      if (!registeredGroups[chatJid]) return;
+      handleNewMessagesForGroup(chatJid);
+    },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
@@ -545,7 +565,7 @@ const isDirectRun =
 
 if (isDirectRun) {
   main().catch((err) => {
-    logger.error({ err }, 'Failed to start NanoClaw');
+    logger.error({ err }, 'Failed to start Stingyclaw');
     process.exit(1);
   });
 }

@@ -50,7 +50,7 @@ Collected ideas from development. Roughly prioritized.
 
 ## Infrastructure
 
-- [ ] **Fix lingering container shutdown** — when nanoclaw restarts, old agent containers block shutdown. Add a pre-stop hook that calls `docker stop nanoclaw-*` before the new process starts
+- [ ] **Fix lingering container shutdown** — when stingyclaw restarts, old agent containers block shutdown. Add a pre-stop hook that calls `docker stop stingyclaw-*` before the new process starts
 - [ ] **Skills engine init** — the `npx tsx scripts/apply-skill.ts --init` command hangs (snapshotting large directories). Fix or rewrite; needed to apply upstream skills automatically
 - [ ] **Upstream sync tooling** — script to `git fetch upstream && git merge upstream/main` and auto-rebuild affected containers; document conflict zones (`container/agent-runner/src/index.ts`, `src/channels/whatsapp.ts`)
 - [ ] **Voice service health in setup verify** — `npx tsx setup/index.ts --step verify` should check `localhost:8001/health` and report voice service status
