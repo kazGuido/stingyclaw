@@ -104,12 +104,12 @@
     },
     {
       "name": "send_voice",
-      "description": "Send a WhatsApp voice note (spoken audio). Use for natural conversational replies, especially when the user sent a voice message. Keep text short — under ~200 words.",
+      "description": "Send a WhatsApp voice note (spoken audio). REQUIRED when the user asks for audio, a voice note, or to hear something spoken — call this with the content; do not reply with text only. Also use when the user sent a voice message. Keep text short — under ~200 words.",
       "parameters": {
         "type": "object",
         "properties": {
           "text": { "type": "string", "description": "Text to speak aloud as a voice note" },
-          "voice": { "type": "string", "description": "Optional speaker: Ryan, Aiden, Vivian, Serena, Uncle_Fu, Dylan, Eric, Ono_Anna, Sohee (default: Ryan)" }
+          "voice": { "type": "string", "description": "Optional speaker or language: Ryan, Aiden, Vivian, Serena, Uncle_Fu, Dylan, Eric, Ono_Anna, Sohee, or French for French TTS (default: Ryan)" }
         },
         "required": ["text"]
       }

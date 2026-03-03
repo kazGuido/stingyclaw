@@ -31,5 +31,6 @@ groups/global/*
 
 # Skills system (local per-installation state)
 .stingyclaw/
+.nanoclaw/
 
 agents-sdk-docs

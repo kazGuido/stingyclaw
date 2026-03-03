@@ -36,6 +36,78 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+let ipcDeps: IpcDeps | null = null;
+let ipcBaseDir: string = '';
+
+/**
+ * Process pending IPC messages (voice, text, image) for a group immediately.
+ * Call this before sending the final result so voice is delivered before any follow-up text.
+ */
+export async function flushMessagesForGroup(sourceGroup: string): Promise<void> {
+  const deps = ipcDeps;
+  if (!deps || !ipcBaseDir) return;
+
+  const isMain = sourceGroup === MAIN_GROUP_FOLDER;
+  const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
+  const registeredGroups = deps.registeredGroups();
+
+  if (!fs.existsSync(messagesDir)) return;
+
+  const messageFiles = fs
+    .readdirSync(messagesDir)
+    .filter((f) => f.endsWith('.json'))
+    .sort(); // Process in creation order (filename has timestamp)
+
+  for (const file of messageFiles) {
+    const filePath = path.join(messagesDir, file);
+    try {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (data.type === 'message' && data.chatJid && data.text) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+          await deps.sendMessage(data.chatJid, data.text);
+          logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent (flush)');
+        }
+      } else if (data.type === 'voice_message' && data.chatJid && data.text) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+          const audio = await synthesizeSpeech(data.text as string, data.voice as string | undefined);
+          if (audio) {
+            await deps.sendVoice(data.chatJid, audio);
+            logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC voice message sent (flush)');
+          } else {
+            await deps.sendMessage(data.chatJid, `Voice synthesis unavailable — sending as text:\n\n${data.text as string}`);
+            logger.warn({ chatJid: data.chatJid }, 'TTS failed, sent as text');
+          }
+        }
+      } else if (data.type === 'image_message' && data.chatJid && data.relativePath) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+          const groupDir = resolveGroupFolderPath(sourceGroup);
+          const imagePath = path.join(groupDir, data.relativePath as string);
+          const rel = path.relative(groupDir, path.resolve(groupDir, data.relativePath as string));
+          if (!rel.startsWith('..') && !path.isAbsolute(rel) && fs.existsSync(imagePath)) {
+            const imageBuffer = fs.readFileSync(imagePath);
+            if (deps.sendImage) {
+              await deps.sendImage(data.chatJid, imageBuffer, data.caption as string | undefined);
+              logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC image sent (flush)');
+            }
+          }
+        }
+      }
+      fs.unlinkSync(filePath);
+    } catch (err) {
+      logger.error({ file, sourceGroup, err }, 'Error processing IPC message (flush)');
+      const errorDir = path.join(ipcBaseDir, 'errors');
+      fs.mkdirSync(errorDir, { recursive: true });
+      try {
+        fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -43,8 +115,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
     return;
   }
   ipcWatcherRunning = true;
-
-  const ipcBaseDir = path.join(DATA_DIR, 'ipc');
+  ipcDeps = deps;
+  ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
@@ -104,8 +176,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     await deps.sendVoice(data.chatJid, audio);
                     logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC voice message sent');
                   } else {
-                    // TTS failed — fall back to text
-                    await deps.sendMessage(data.chatJid, data.text as string);
+                    await deps.sendMessage(data.chatJid, `Voice synthesis unavailable — sending as text:\n\n${data.text as string}`);
                     logger.warn({ chatJid: data.chatJid }, 'TTS failed, sent as text');
                   }
                 } else {

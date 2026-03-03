@@ -8,13 +8,13 @@ services:
     ports:
       - "127.0.0.1:8001:8001"
     volumes:
-      # LFM2.5-Audio model cache (HuggingFace) persists across rebuilds
+      # Hugging Face cache for NeuTTS Air + Neucodec (persists across rebuilds)
       - voice-models:/models
-    # TTS tunables (optional): TTS_SPEED, TTS_TEMPERATURE, TTS_TOP_P
     environment:
-      - TTS_SPEED=1
-      - TTS_TEMPERATURE=0.95
-      - TTS_TOP_P=0.95
+      - HF_HOME=/models
+      - TTS_SPEED=1.02
+    # Ensure voice has enough RAM when agent container is also running
+    mem_limit: 3g
 
 volumes:
   voice-models:

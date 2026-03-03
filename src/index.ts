@@ -34,7 +34,7 @@ import {
 } from './db.js';
 import { GroupQueue, MAX_RETRIES } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { startIpcWatcher } from './ipc.js';
+import { flushMessagesForGroup, startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { synthesizeSpeech } from './transcription.js';
 import { startSchedulerLoop } from './task-scheduler.js';
@@ -245,6 +245,9 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     }
 
     if (result.result) {
+      // Flush pending IPC (voice, message, image) before sending final text.
+      // Ensures voice is delivered first when agent uses send_voice + text follow-up.
+      await flushMessagesForGroup(group.folder);
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
@@ -257,7 +260,7 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
             await channel.sendVoice(chatJid, audio);
             outputSentToUser = true;
           } else {
-            await channel.sendMessage(chatJid, text);
+            await channel.sendMessage(chatJid, `Voice synthesis unavailable — sending as text:\n\n${text}`);
             outputSentToUser = true;
           }
         } else {

@@ -3,7 +3,7 @@
 
 FROM node:22-slim
 
-# Install system dependencies (Chromium/Playwright deps for agent-browser screenshots)
+# Install system dependencies (Chromium/Playwright deps for agent-browser)
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -33,11 +33,10 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install agent-browser (headless browser CLI for AI agents)
-# Chromium is stored in a shared path so the node user can access it
+# Install agent-browser (pinned for stability; install Chromium without --with-deps since we have deps above)
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright
-RUN npm install -g agent-browser && \
-    agent-browser install --with-deps && \
+RUN npm install -g agent-browser@0.15.2 && \
+    agent-browser install && \
     chmod -R a+rx /usr/local/share/playwright
 
 # Create app directory

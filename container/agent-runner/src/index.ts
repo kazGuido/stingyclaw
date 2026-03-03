@@ -7,6 +7,7 @@
  *
  * Tools: loaded from tool registry (single source of truth). Filtered by
  * enabled-tools config per context (main vs group). Optional MCP later.
+ * Tool discovery: semantic search for top-K relevant tools to save context tokens.
  */
 
 import fs from 'fs';
@@ -22,6 +23,9 @@ import { pipeline, env as xenovaEnv } from '@xenova/transformers';
 xenovaEnv.cacheDir = '/home/node/.stingyclaw/transformers';
 
 const execAsync = promisify(exec);
+
+// Import semantic tool search (must be loaded before first use)
+import { semanticToolSearch } from './semantic-tool-search.js';
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -125,12 +129,36 @@ function getEnabledToolNames(registry: ToolRegistry, isMain: boolean): string[] 
   return (registry.defaultEnabledNonMain ?? []).filter((n) => allNames.includes(n));
 }
 
-// ─── Local embedder (lazy-loaded, shared across tool calls) ──────────────────
+/** Get tools filtered by enabled list; when query is set, semantically pick top-K. */
+async function getToolsForContext(
+  registry: ToolRegistry,
+  isMain: boolean,
+  query?: string,
+  topK: number = 6,
+): Promise<OpenAI.ChatCompletionTool[]> {
+  const enabledNames = new Set(getEnabledToolNames(registry, isMain));
+  const filteredTools = registry.tools.filter((t) => enabledNames.has(t.name));
 
+  if (!query?.trim()) {
+    return buildOpenAITools({ tools: filteredTools });
+  }
+
+  try {
+    const results = await semanticToolSearch.searchAsync(query, topK);
+    const topKNames = new Set(results.map((r) => r.name));
+    const selectedTools = filteredTools.filter((t) => topKNames.has(t.name));
+    log(`[semantic search] ${selectedTools.length} tools: ${results.map((r) => `${r.name}(${r.score.toFixed(2)})`).join(', ')}`);
+    return buildOpenAITools({ tools: selectedTools });
+  } catch (err) {
+    log(`[semantic search] Fallback: ${(err as Error).message}`);
+    return buildOpenAITools({ tools: filteredTools });
+  }
+}
+
+// ─── Local embedder (workflow search / embedding cache) ───────────────────────
 const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _embedder: any = null;
-
 async function getEmbedder() {
   if (!_embedder) {
     log(`Loading embedding model ${EMBED_MODEL}...`);
@@ -338,49 +366,136 @@ function buildSystemPrompt(input: ContainerInput): string {
   const name = input.assistantName || 'Andy';
   const parts: string[] = [
     `You are ${name}, a helpful AI assistant connected to a WhatsApp chat.
-You have access to tools to complete tasks. Use them proactively.
-Be concise — WhatsApp messages should be short and to the point.
-For long-running work, use send_message to send intermediate updates.
-Your final text response (after all tool calls) is sent to the user automatically.
-Screenshots and images — mandatory:
-- When the user asks to see a screenshot (or a page, diagram, image), you MUST call send_image(path) so the image appears in the chat. Do not only reply with text saying \"saved to page.png\".
-- After running \`agent-browser screenshot <filename>\`, immediately call send_image with that path (e.g. send_image(\"page.png\")) before any final text reply. Never Read an image file to show it — only send_image delivers it to the user.
 
-Working directory: /workspace/group — read/write files here freely.
+=== CRITICAL TOOL USAGE RULES (READ THESE FIRST) ===
+
+You MUST call the right tool for the task. If you don't, the user will NOT receive what they asked for.
+
+1. When user asks for AUDIO or a VOICE NOTE:
+   - You MUST call send_voice(text: "...") with the message content.
+   - Do NOT reply with plain text only. If you don't call send_voice, the user gets NO audio.
+
+2. When user sends a VOICE MESSAGE (text starts with "[Voice: ...]"):
+   - You MUST call send_voice(text: "...") as your response. Do not reply with text only.
+
+3. When user asks for a SCREENSHOT or IMAGE (of a page, diagram, saved file, output):
+   - You MUST call send_image(path: "file.png") to show the image in the chat.
+   - After agent-browser screenshot file.png: immediately call send_image("file.png") before any text reply.
+   - Do NOT say "saved to file.png" — that text alone does not show the image.
+
+4. When you are about to do something RISKY or IRREVERSIBLE:
+   - Call ask_boss(question: "...") to get user approval first.
+   - Do NOT proceed without approval if you are unsure.
+
+5. Always use submit_plan() before multi-step tasks:
+   - Call submit_plan(steps: ["Step 1", "Step 2", ...]) first.
+   - Execute each step in order.
+   - When done: store_memory("one-line summary") then clear_plan().
+
+=== YOUR TOOLS AND HOW TO USE THEM ===
+
+Tool: send_voice
+  Description: Send spoken audio to the chat (OGG Opus voice note).
+  When to use: 
+    • User asks for audio, voice note, or to hear something ("send me audio", "reply with voice", "say it in a voice note")
+    • User sent a voice message (your reply must also be voice)
+    • You want a natural conversational reply (short messages under 150 words)
+  How to use: send_voice(text: "short message under 150 words", voice?: "Ryan" | "Aiden" | "Vivian" | "Serena" | "Uncle_Fu" | "Dylan" | "Eric" | "Ono_Anna" | "Sohee" | "French")
+  Use voice "French" when the user wants French speech.
+  WARNING: If you don't call this when user asks for audio, they get NOTHING audible.
+
+Tool: send_image  
+  Description: Send an image file to the chat so the user sees it (not just text).
+  When to use:
+    • After screenshotting anything (agent-browser screenshot, page.png, diagram.png)
+    • User asks to see an image, screenshot, or visual output
+  How to use: send_image(path: "relative.png", caption?: "optional text")
+  WARNING: If you don't call this after a screenshot, the user sees NOTHING.
+
+Tool: send_message
+  Description: Send immediate text updates (for progress, confirmation, or when still working).
+  When to use:
+    • Long-running tasks — send progress updates
+    • You need to communicate before finishing
+    • Scheduled tasks that must report results
+  How to use: send_message(text: "progress update or final result")
+
+Tool: ask_boss
+  Description: Ask the user for guidance before risky actions or when unsure.
+  When to use:
+    • Before destructive actions (delete, overwrite, modify configs)
+    • You don't have enough context to proceed safely
+    • You need user approval to continue
+  How to use: ask_boss(question: "clear question that user can answer yes/no or with guidance")
+  Result: Your message is sent; their reply comes in the next turn. Stop and wait.
+
+Tool: Bash
+  Description: Run shell commands in /workspace/group (timeout: 30s default, max 120s).
+  Use for: Quick checks, file operations, running scripts, debugging.
+  Example: Bash(command: "ls -la && cat README.md", timeout: 60000)
+
+Tool: Read, Glob, Grep
+  Description: Read files, find files by pattern, search file contents with rg (ripgrep).
+  Use for: Understanding codebases, finding files, searching for patterns.
+  Example: Grep(pattern: "TODO", flags: "-i", path: "/workspace/group/src")
+
+Tool: WebFetch, agent-browser
+  Description: Fetch static pages (WebFetch) or full browser (agent-browser for JS, logins, interactions).
+  agent-browser commands:
+    - agent-browser open <url>
+    - agent-browser snapshot          # get page elements with refs @e1, @e2, etc.
+    - agent-browser snapshot -i        # interactive snapshot
+    - agent-browser click @e1
+    - agent-browser fill @e2 "text"
+    - agent-browser get text @e1      # extract text from element
+    - agent-browser screenshot file.png
+    - agent-browser close
+  ALWAYS call send_image("file.png") after screenshot.
+
+Tool: submit_plan, store_memory, clear_plan, consult_memory
+  Submit an execution plan before multi-step work. Store key facts across turns. Clear the plan when done.
+  submit_plan(steps: ["Step 1", "Step 2"])
+  store_memory(content: "one-line summary or fact to remember")
+  consult_memory()  # Read current stored memory
+  clear_plan()      # Clear after execution
+
+Tool: list_workflows, search_tools, run_workflow
+  Pre-built automations the user has configured. Use these instead of building from scratch.
+  - list_workflows()     # Show all available workflows
+  - search_tools(query)  # Find workflows by intent
+  - run_workflow(name, args)  # Run a workflow
+
+Tool: available_groups, refresh_groups, register_group
+  WhatsApp group management (main group only).
+  - available_groups()          # List discovered groups
+  - refresh_groups()            # Refresh from WhatsApp
+  - register_group(jid, name, folder, trigger)  # Register a new group
+
+Tool: schedule_task, list_tasks, pause_task, resume_task, cancel_task
+  Schedule recurring or one-time tasks (scheduled tasks run as full agents).
+  - schedule_task(prompt, schedule_type: "cron"|"interval"|"once", schedule_value, context_mode: "group"|"isolated")
+  - list_tasks()
+  - pause_task(task_id), resume_task(task_id), cancel_task(task_id)
+
+=== WORKFLOW ===
+
+1. User sends message → you analyze what they want
+2. If multi-step: call submit_plan() first with ordered steps
+3. Execute steps using tools (Bash, Read, WebFetch, agent-browser, etc.)
+4. When done (or confirming): send message if needed, store_memory summary, clear_plan
+5. Your final text response is sent automatically after tool calls complete
+
+=== SYSTEM CONTEXT ===
+
+Working directory: /workspace/group — read/write files freely.
 Extra directories may be mounted at /workspace/extra/*/
 
-Web browsing — use agent-browser for any page that needs it:
-- \`agent-browser open <url>\` → navigate
-- \`agent-browser snapshot -i\` → get interactive elements (buttons, links, inputs) with refs like @e1, @e2
-- \`agent-browser click @e1\` / \`agent-browser fill @e2 "text"\` → interact via refs
-- \`agent-browser get text @e1\` / \`agent-browser screenshot page.png\` → extract content. After screenshot, always call send_image(\"page.png\") so the user sees it in the chat.
-- \`agent-browser close\` when done
-- Use WebFetch for simple static pages (faster). Use agent-browser for JS-heavy pages, login flows, or when you need to interact.
+Voice service: Your TTS is available via send_voice. Keep voice replies under ~150 words.
+Model: You are running with ${input.isMain ? 'main group context (full tool access)' : 'group context (filtered tools)'}.
+Session ID: ${input.sessionId || 'new'}
+Last agent timestamp: ${input.chatJid} — ${input.groupFolder}
 
-Voice rules — follow these strictly:
-- When the user's message starts with [Voice: ...], you MUST call send_voice as your response. Do not reply with plain text alone.
-- Keep voice replies short — under ~150 words (about 30 seconds of speech).
-- After send_voice you may optionally add a short text follow-up for links, code, or anything that doesn't work well spoken.
-- For non-voice messages, use send_voice only when it genuinely adds value (e.g. the user explicitly asks for spoken output).
-
-Groups (main only) — use dedicated tools, never Bash:
-- To see WhatsApp groups → call available_groups (never Bash cat /workspace/ipc/available_groups.json)
-- To refresh the list after user adds a group → call refresh_groups (never Bash echo)
-- To register a new group → call register_group with jid, name, folder, trigger from available_groups
-
-Workflows — pre-built automations the user has defined:
-- When asked "what can you do?" or "what workflows exist?" → call list_workflows
-- When the user asks you to do something → call search_tools("intent") first to check if a workflow exists
-- If found → run it with run_workflow(name, args)
-- If not found → use your built-in tools (Bash, WebFetch, etc.) directly
-
-Plan → Execute → Summarize (for efficient execution):
-- For any multi-step task (e.g. open URL, take screenshot, send image to chat), first call submit_plan with a short ordered list of steps. Then execute the steps in order with tool calls. Do not skip steps (e.g. after screenshot you must send_image). When done, call store_memory with a one-line summary and clear_plan.
-- If you see "Current plan" below, follow it step by step; then summarize and clear.
-
-Tell the boss — when stuck or unsure:
-- If you're not sure what to do, about to do something risky/irreversible, or need human approval, use ask_boss to ask the user first.
-- Do NOT guess or proceed blindly. Your message will be sent; their reply will come in the next message. Stop and wait for it.`,
+${input.isScheduledTask ? '\n\n[SCHEDULED TASK — this is an automated agent task, not directly from user. Your output is sent via send_message if needed.]' : ''}`,
   ];
 
   // (no secondary AI CLI — the primary model handles everything directly)
@@ -461,14 +576,7 @@ function waitForIpcMessage(): Promise<string | null> {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-// Tools are built from tool-registry.json and filtered by context (see getToolsForContext).
-
-function getToolsForContext(input: ContainerInput): OpenAI.ChatCompletionTool[] {
-  const registry = loadToolRegistry();
-  const all = buildOpenAITools(registry);
-  const enabled = new Set(getEnabledToolNames(registry, input.isMain));
-  return all.filter((t) => t.function && enabled.has(t.function.name));
-}
+// Tools are built from tool-registry.json; semantic search picks top-K by query when provided.
 
 /** Append one line to the audit log (who, when, tool, success, result size). */
 function auditLog(
@@ -1012,6 +1120,11 @@ async function runQuery(
   const registry = loadToolRegistry();
   const systemPrompt = buildSystemPrompt(input);
 
+  await semanticToolSearch.load(registry);
+  // Use prompt for semantic tool choice only when it's a real user message, not a confirmation reply
+  const queryForTools = session.pendingConfirmation ? undefined : (prompt?.trim() || undefined);
+  const toolsForContext = await getToolsForContext(registry, input.isMain, queryForTools, 8);
+
   // Resuming from confirmation: user replied yes/no; execute or cancel pending tool, then continue loop.
   if (session.pendingConfirmation && prompt) {
     const reply = prompt.trim().toLowerCase();
@@ -1038,7 +1151,6 @@ async function runQuery(
     session.messages.push({ role: 'user', content: prompt });
   }
 
-  const toolsForContext = getToolsForContext(input);
   let lastText: string | null = null;
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
