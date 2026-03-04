@@ -72,7 +72,9 @@ async def lifespan(app: FastAPI):
             _tts_cache[lang] = loaded
             print(f"[voice] Loaded {lang} TTS (warm)", flush=True)
         except Exception as e:
+            import traceback
             print(f"[voice] Failed to load {lang}: {e}", flush=True)
+            traceback.print_exc()
     yield
     _tts_cache.clear()
 
@@ -146,6 +148,7 @@ async def synthesize(req: SynthRequest):
 
     lang = _normalize_language(req.voice, req.language)
     tts, ref_codes, ref_text = _get_tts(lang)
+    text = req.text.strip()
 
     with tempfile.TemporaryDirectory() as tmp:
         wav_path = Path(tmp) / "output.wav"
@@ -153,7 +156,7 @@ async def synthesize(req: SynthRequest):
 
         def _infer():
             import soundfile as sf
-            wav = tts.infer(req.text.strip(), ref_codes, ref_text)
+            wav = tts.infer(text, ref_codes, ref_text)
             sf.write(str(wav_path), wav, 24000)
 
         loop = asyncio.get_event_loop()
@@ -163,10 +166,20 @@ async def synthesize(req: SynthRequest):
                 timeout=120.0,
             )
         except asyncio.TimeoutError:
+            print(f"[voice] TTS timeout (lang={lang}, len={len(text)})", flush=True)
             raise HTTPException(504, "Synthesis timed out")
+        except Exception as e:
+            print(f"[voice] TTS infer error: {e}", flush=True)
+            raise HTTPException(500, f"TTS failed: {e!s}")
 
         if not wav_path.exists():
+            print("[voice] TTS produced no WAV file", flush=True)
             raise HTTPException(500, "TTS failed to produce audio")
 
-        _wav_to_ogg(wav_path, ogg_path, TTS_SPEED)
+        try:
+            _wav_to_ogg(wav_path, ogg_path, TTS_SPEED)
+        except Exception as e:
+            print(f"[voice] ffmpeg error: {e}", flush=True)
+            raise HTTPException(500, f"Encode failed: {e!s}")
+
         return Response(content=ogg_path.read_bytes(), media_type="audio/ogg")

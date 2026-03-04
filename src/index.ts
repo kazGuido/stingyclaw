@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   buildTriggerPattern,
   DATA_DIR,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
 } from './config.js';
@@ -79,6 +80,69 @@ function saveState(): void {
   );
 }
 
+const HARD_RESET_CLAW = '[HARD_RESET_CLAW]';
+const CONFIRM_HARD_RESET = '[CONFIRM_HARD_RESET]';
+const PENDING_HARD_RESET_JID_KEY = 'pending_hard_reset_jid';
+
+/** Reset conversation and memory for a single group (chat-specific). No AI, no cursor change. */
+function resetStateForGroup(groupFolder: string): void {
+  clearSessionInDb(groupFolder);
+  delete sessions[groupFolder];
+  const stingySessions = path.join(DATA_DIR, 'sessions', groupFolder, '.stingyclaw', 'sessions');
+  if (fs.existsSync(stingySessions)) {
+    for (const file of fs.readdirSync(stingySessions)) {
+      if (file.endsWith('.json')) fs.unlinkSync(path.join(stingySessions, file));
+    }
+  }
+  const groupDir = path.join(GROUPS_DIR, groupFolder);
+  for (const name of ['.agent-memory.json', '.agent-current-plan.json']) {
+    const p = path.join(groupDir, name);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  }
+}
+
+/**
+ * If the message batch contains hard-reset codewords, handle them (no AI): confirm prompt or execute reset.
+ * Advances cursor and returns true so caller does not enqueue/send to agent.
+ */
+function handleHardResetCodewords(
+  chatJid: string,
+  group: RegisteredGroup,
+  messages: Array<{ content: string; is_from_me?: boolean; timestamp: string }>,
+  channel: Channel,
+): boolean {
+  const pendingJid = getRouterState(PENDING_HARD_RESET_JID_KEY) || '';
+  const userMessages = messages.filter((m) => !m.is_from_me);
+  const lastTs = messages[messages.length - 1]?.timestamp ?? '';
+
+  const hasConfirm = userMessages.some((m) => m.content.includes(CONFIRM_HARD_RESET));
+  const hasTrigger = userMessages.some((m) => m.content.includes(HARD_RESET_CLAW));
+
+  if (hasConfirm && pendingJid === chatJid) {
+    resetStateForGroup(group.folder);
+    setRouterState(PENDING_HARD_RESET_JID_KEY, '');
+    lastAgentTimestamp[chatJid] = lastTs;
+    saveState();
+    channel.sendMessage(
+      chatJid,
+      'Done. State reset for this chat.',
+    ).catch((err) => logger.warn({ chatJid, err }, 'Failed to send hard-reset confirmation'));
+    logger.info({ group: group.name }, 'Hard reset (codeword) completed');
+    return true;
+  }
+  if (hasTrigger) {
+    setRouterState(PENDING_HARD_RESET_JID_KEY, chatJid);
+    lastAgentTimestamp[chatJid] = lastTs;
+    saveState();
+    channel.sendMessage(
+      chatJid,
+      `This will reset conversation and memory for this chat. Reply with ${CONFIRM_HARD_RESET} to confirm.`,
+    ).catch((err) => logger.warn({ chatJid, err }, 'Failed to send hard-reset prompt'));
+    return true;
+  }
+  return false;
+}
+
 function registerGroup(jid: string, group: RegisteredGroup): void {
   let groupDir: string;
   try {
@@ -127,6 +191,8 @@ function handleNewMessagesForGroup(chatJid: string): void {
   );
   if (allPending.length === 0) return;
 
+  if (handleHardResetCodewords(chatJid, group, allPending, channel)) return;
+
   if (needsTrigger) {
     const triggerPattern = buildTriggerPattern(group.trigger);
     const hasTrigger = allPending.some((m) => triggerPattern.test(m.content.trim()));
@@ -174,7 +240,7 @@ export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): v
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
-async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; error?: string }> {
+async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; error?: string; noRetry?: boolean }> {
   const group = registeredGroups[chatJid];
   if (!group) return { ok: true };
 
@@ -198,6 +264,10 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       triggerPattern.test(m.content.trim()),
     );
     if (!hasTrigger) return { ok: true };
+  }
+
+  if (handleHardResetCodewords(chatJid, group, missedMessages, channel)) {
+    return { ok: true };
   }
 
   const prompt = formatMessages(missedMessages);
@@ -245,9 +315,13 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     }
 
     if (result.result) {
-      // Flush pending IPC (voice, message, image) before sending final text.
-      // Ensures voice is delivered first when agent uses send_voice + text follow-up.
+      // Flush pending IPC (voice, message, image) before sending any conclusive text.
+      // Ensures audio is delivered first when agent uses send_voice + text follow-up.
       await flushMessagesForGroup(group.folder);
+      // Brief wait then flush again — container may write IPC slightly after stdout.
+      await new Promise((r) => setTimeout(r, 400));
+      await flushMessagesForGroup(group.folder);
+
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
@@ -260,7 +334,10 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
             await channel.sendVoice(chatJid, audio);
             outputSentToUser = true;
           } else {
-            await channel.sendMessage(chatJid, `Voice synthesis unavailable — sending as text:\n\n${text}`);
+            await channel.sendMessage(
+              chatJid,
+              `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${text}`,
+            );
             outputSentToUser = true;
           }
         } else {
@@ -291,11 +368,15 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
       return { ok: true };
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-    return { ok: false, error: output.error };
+    const noRetry = output.noRetry === true;
+    if (!noRetry) {
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
+      logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+    } else {
+      saveState();
+    }
+    return { ok: false, error: output.error, noRetry };
   }
 
   return { ok: true };
@@ -306,7 +387,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<{ status: 'success' | 'error'; error?: string }> {
+): Promise<{ status: 'success' | 'error'; error?: string; noRetry?: boolean }> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
@@ -371,7 +452,7 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      return { status: 'error', error: output.error };
+      return { status: 'error', error: output.error ?? 'Agent error', noRetry: true };
     }
 
     return { status: 'success' };
@@ -550,8 +631,10 @@ async function main(): Promise<void> {
   queue.setOnMaxRetriesExceeded((groupJid, error) => {
     const channel = findChannel(channels, groupJid);
     if (!channel) return;
-    const errorText = error ? error.slice(0, 300) : 'unknown error';
-    const msg = `⚠️ Agent failed after ${MAX_RETRIES} retries and gave up.\n\nLast error:\n\`${errorText}\`\n\nSend another message to retry.`;
+    const errorText = (error && error.slice(0, 400)) || 'Something went wrong. Please try again.';
+    const msg = error?.includes('temporarily unavailable')
+      ? errorText
+      : `⚠️ ${errorText}\n\nSend another message to retry.`;
     channel.sendMessage(groupJid, msg).catch((err) =>
       logger.error({ groupJid, err }, 'Failed to send error notification'),
     );

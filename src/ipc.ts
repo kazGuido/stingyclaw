@@ -13,10 +13,10 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { createTask, deleteTask, getRecentMessages, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { NewMessage, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -56,32 +56,42 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
   const messageFiles = fs
     .readdirSync(messagesDir)
     .filter((f) => f.endsWith('.json'))
-    .sort(); // Process in creation order (filename has timestamp)
+    .sort();
 
+  // Process voice first, then image, then text — so audio/caption order is correct for the user
+  const typeOrder = (t: string) => (t === 'voice_message' ? 0 : t === 'image_message' ? 1 : 2);
+  const entries: { file: string; data: Record<string, unknown> }[] = [];
   for (const file of messageFiles) {
-    const filePath = path.join(messagesDir, file);
     try {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      if (data.type === 'message' && data.chatJid && data.text) {
-        const targetGroup = registeredGroups[data.chatJid];
-        if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-          await deps.sendMessage(data.chatJid, data.text);
-          logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent (flush)');
-        }
-      } else if (data.type === 'voice_message' && data.chatJid && data.text) {
-        const targetGroup = registeredGroups[data.chatJid];
+      const data = JSON.parse(fs.readFileSync(path.join(messagesDir, file), 'utf-8')) as Record<string, unknown>;
+      entries.push({ file, data });
+    } catch {
+      /* skip corrupt file, will retry or error on next pass */
+    }
+  }
+  entries.sort((a, b) => typeOrder((a.data.type as string) ?? '') - typeOrder((b.data.type as string) ?? ''));
+
+  for (const { file, data } of entries) {
+    const filePath = path.join(messagesDir, file);
+    const chatJid = typeof data.chatJid === 'string' ? data.chatJid : undefined;
+    try {
+      if (data.type === 'voice_message' && chatJid && data.text) {
+        const targetGroup = registeredGroups[chatJid];
         if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
           const audio = await synthesizeSpeech(data.text as string, data.voice as string | undefined);
           if (audio) {
-            await deps.sendVoice(data.chatJid, audio);
-            logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC voice message sent (flush)');
+            await deps.sendVoice(chatJid, audio);
+            logger.info({ chatJid, sourceGroup }, 'IPC voice message sent (flush)');
           } else {
-            await deps.sendMessage(data.chatJid, `Voice synthesis unavailable — sending as text:\n\n${data.text as string}`);
-            logger.warn({ chatJid: data.chatJid }, 'TTS failed, sent as text');
+            await deps.sendMessage(
+              chatJid,
+              `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${data.text as string}`,
+            );
+            logger.warn({ chatJid }, 'TTS failed, sent as text');
           }
         }
-      } else if (data.type === 'image_message' && data.chatJid && data.relativePath) {
-        const targetGroup = registeredGroups[data.chatJid];
+      } else if (data.type === 'image_message' && chatJid && data.relativePath) {
+        const targetGroup = registeredGroups[chatJid];
         if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
           const groupDir = resolveGroupFolderPath(sourceGroup);
           const imagePath = path.join(groupDir, data.relativePath as string);
@@ -89,10 +99,16 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
           if (!rel.startsWith('..') && !path.isAbsolute(rel) && fs.existsSync(imagePath)) {
             const imageBuffer = fs.readFileSync(imagePath);
             if (deps.sendImage) {
-              await deps.sendImage(data.chatJid, imageBuffer, data.caption as string | undefined);
-              logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC image sent (flush)');
+              await deps.sendImage(chatJid, imageBuffer, data.caption as string | undefined);
+              logger.info({ chatJid, sourceGroup }, 'IPC image sent (flush)');
             }
           }
+        }
+      } else if (data.type === 'message' && chatJid && data.text) {
+        const targetGroup = registeredGroups[chatJid];
+        if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+          await deps.sendMessage(chatJid, data.text as string);
+          logger.info({ chatJid, sourceGroup }, 'IPC message sent (flush)');
         }
       }
       fs.unlinkSync(filePath);
@@ -143,47 +159,42 @@ export function startIpcWatcher(deps: IpcDeps): void {
       // Process messages from this group's IPC directory
       try {
         if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs
-            .readdirSync(messagesDir)
-            .filter((f) => f.endsWith('.json'));
+          const messageFiles = fs.readdirSync(messagesDir).filter((f) => f.endsWith('.json'));
+          const typeOrder = (t: string) => (t === 'voice_message' ? 0 : t === 'image_message' ? 1 : 2);
+          const entries: { file: string; data: Record<string, unknown> }[] = [];
           for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
-                }
-              } else if (data.type === 'voice_message' && data.chatJid && data.text) {
-                const targetGroup = registeredGroups[data.chatJid];
+              const data = JSON.parse(fs.readFileSync(path.join(messagesDir, file), 'utf-8')) as Record<string, unknown>;
+              entries.push({ file, data });
+            } catch {
+              /* skip */
+            }
+          }
+          entries.sort((a, b) => typeOrder((a.data.type as string) ?? '') - typeOrder((b.data.type as string) ?? ''));
+
+          for (const { file, data } of entries) {
+            const filePath = path.join(messagesDir, file);
+            const chatJid = typeof data.chatJid === 'string' ? data.chatJid : undefined;
+            try {
+              if (data.type === 'voice_message' && chatJid && data.text) {
+                const targetGroup = registeredGroups[chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
                   const audio = await synthesizeSpeech(data.text as string, data.voice as string | undefined);
                   if (audio) {
-                    await deps.sendVoice(data.chatJid, audio);
-                    logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC voice message sent');
+                    await deps.sendVoice(chatJid, audio);
+                    logger.info({ chatJid, sourceGroup }, 'IPC voice message sent');
                   } else {
-                    await deps.sendMessage(data.chatJid, `Voice synthesis unavailable — sending as text:\n\n${data.text as string}`);
-                    logger.warn({ chatJid: data.chatJid }, 'TTS failed, sent as text');
+                    await deps.sendMessage(
+                      chatJid,
+                      `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${data.text as string}`,
+                    );
+                    logger.warn({ chatJid }, 'TTS failed, sent as text');
                   }
                 } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC voice_message blocked');
+                  logger.warn({ chatJid, sourceGroup }, 'Unauthorized IPC voice_message blocked');
                 }
-              } else if (data.type === 'image_message' && data.chatJid && data.relativePath) {
-                const targetGroup = registeredGroups[data.chatJid];
+              } else if (data.type === 'image_message' && chatJid && data.relativePath) {
+                const targetGroup = registeredGroups[chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
                   const groupDir = resolveGroupFolderPath(sourceGroup);
                   const imagePath = path.join(groupDir, data.relativePath as string);
@@ -193,30 +204,36 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   } else if (fs.existsSync(imagePath)) {
                     const imageBuffer = fs.readFileSync(imagePath);
                     if (deps.sendImage) {
-                      await deps.sendImage(data.chatJid, imageBuffer, data.caption as string | undefined);
-                      logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC image sent');
+                      await deps.sendImage(chatJid, imageBuffer, data.caption as string | undefined);
+                      logger.info({ chatJid, sourceGroup }, 'IPC image sent');
                     } else {
-                      logger.warn({ chatJid: data.chatJid }, 'Channel does not support sendImage');
+                      logger.warn({ chatJid }, 'Channel does not support sendImage');
                     }
                   } else {
                     logger.warn({ imagePath, sourceGroup }, 'IPC image file not found');
                   }
                 } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC image_message blocked');
+                  logger.warn({ chatJid, sourceGroup }, 'Unauthorized IPC image_message blocked');
+                }
+              } else if (data.type === 'message' && chatJid && data.text) {
+                const targetGroup = registeredGroups[chatJid];
+                if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+                  await deps.sendMessage(chatJid, data.text as string);
+                  logger.info({ chatJid, sourceGroup }, 'IPC message sent');
+                } else {
+                  logger.warn({ chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
                 }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
+              logger.error({ file, sourceGroup, err }, 'Error processing IPC message');
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              try {
+                fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
+              } catch {
+                /* ignore */
+              }
             }
           }
         }
@@ -503,7 +520,7 @@ export async function processTaskIpc(
         fs.writeFileSync(
           responsePath,
           JSON.stringify({
-            messages: messages.map((m) => ({
+            messages: messages.map((m: NewMessage) => ({
               sender: m.sender_name,
               content: m.content,
               timestamp: m.timestamp,

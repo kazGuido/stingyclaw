@@ -522,6 +522,15 @@ export function clearSession(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
+/**
+ * Reset router state and all sessions for a clean slate (no pending cursors, no retries, fresh conversations).
+ * Does not touch registered groups, messages, chats, or auth.
+ */
+export function resetRouterAndSessionState(): void {
+  db.prepare('DELETE FROM router_state').run();
+  db.prepare('DELETE FROM sessions').run();
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, session_id FROM sessions')

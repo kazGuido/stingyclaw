@@ -31,7 +31,7 @@ export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
   private waitingGroups: string[] = [];
-  private processMessagesFn: ((groupJid: string) => Promise<{ ok: boolean; error?: string }>) | null = null;
+  private processMessagesFn: ((groupJid: string) => Promise<{ ok: boolean; error?: string; noRetry?: boolean }>) | null = null;
   private onMaxRetriesExceededFn: ((groupJid: string, error?: string) => void) | null = null;
   private shuttingDown = false;
 
@@ -55,7 +55,7 @@ export class GroupQueue {
     return state;
   }
 
-  setProcessMessagesFn(fn: (groupJid: string) => Promise<{ ok: boolean; error?: string }>): void {
+  setProcessMessagesFn(fn: (groupJid: string) => Promise<{ ok: boolean; error?: string; noRetry?: boolean }>): void {
     this.processMessagesFn = fn;
   }
 
@@ -209,6 +209,14 @@ export class GroupQueue {
         if (result.ok) {
           state.retryCount = 0;
           state.lastError = undefined;
+        } else if (result.noRetry) {
+          state.retryCount = 0;
+          state.lastError = undefined;
+          state.pendingMessages = false;
+          const userMessage = result.error?.startsWith('PROVIDER_UNAVAILABLE:')
+            ? result.error.slice('PROVIDER_UNAVAILABLE:'.length).trim()
+            : (result.error || 'Something went wrong. Please try again.');
+          this.onMaxRetriesExceededFn?.(groupJid, userMessage);
         } else {
           state.lastError = result.error;
           this.scheduleRetry(groupJid, state);

@@ -223,9 +223,8 @@ export class WhatsAppChannel implements Channel {
             const sender = msg.key.participant || msg.key.remoteJid || '';
             const senderName = msg.pushName || sender.split('@')[0];
             const fromMe = msg.key.fromMe || false;
-            const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
-              ? fromMe
-              : content.startsWith(`${ASSISTANT_NAME}:`);
+            // Any message we sent is a bot message (avoids agent reacting to its own voice/text)
+            const isBotMessage = fromMe || (ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`));
 
             this.opts.onMessage(chatJid, {
               id: msg.key.id || '',
@@ -240,11 +239,13 @@ export class WhatsAppChannel implements Channel {
             continue;
           }
 
+          const imageMsg = msg.message?.imageMessage;
+          const videoMsg = msg.message?.videoMessage;
           const content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
-            msg.message?.imageMessage?.caption ||
-            msg.message?.videoMessage?.caption ||
+            (imageMsg ? `[Image]${imageMsg.caption ? ` ${imageMsg.caption}` : ''}`.trim() : '') ||
+            (videoMsg ? `[Video]${videoMsg.caption ? ` ${videoMsg.caption}` : ''}`.trim() : '') ||
             '';
 
           // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
@@ -254,13 +255,9 @@ export class WhatsAppChannel implements Channel {
           const senderName = msg.pushName || sender.split('@')[0];
 
           const fromMe = msg.key.fromMe || false;
-          // Detect bot messages: with own number, fromMe is reliable
-          // since only the bot sends from that number.
-          // With shared number, bot messages carry the assistant name prefix
-          // (even in DMs/self-chat) so we check for that.
-          const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
-            ? fromMe
-            : content.startsWith(`${ASSISTANT_NAME}:`);
+          // Any message we sent is a bot message (avoids agent reacting to its own replies).
+          // With shared number, also treat assistant-prefixed content as bot.
+          const isBotMessage = fromMe || (ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`));
 
           this.opts.onMessage(chatJid, {
             id: msg.key.id || '',

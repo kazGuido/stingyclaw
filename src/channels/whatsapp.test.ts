@@ -460,7 +460,25 @@ describe('WhatsAppChannel', () => {
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'registered@g.us',
-        expect.objectContaining({ content: 'Check this photo' }),
+        expect.objectContaining({ content: '[Image] Check this photo' }),
+      );
+    });
+
+    it('delivers image with no caption as [Image]', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+      await triggerMessages([
+        {
+          key: { id: 'img-1', remoteJid: 'registered@g.us', participant: '555@s.whatsapp.net', fromMe: false },
+          message: { imageMessage: { mimetype: 'image/jpeg' } },
+          pushName: 'User',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({ content: '[Image]' }),
       );
     });
 
@@ -488,7 +506,7 @@ describe('WhatsAppChannel', () => {
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'registered@g.us',
-        expect.objectContaining({ content: 'Watch this' }),
+        expect.objectContaining({ content: '[Video] Watch this' }),
       );
     });
 

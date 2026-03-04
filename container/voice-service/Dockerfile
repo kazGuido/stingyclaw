@@ -1,6 +1,8 @@
+# syntax=docker/dockerfile:1
 # Voice service: NeuTTS Air Q4-GGUF (TTS only)
 # https://huggingface.co/neuphonic/neutts-air-q4-gguf
 # Requires espeak-ng for phonemizer; models downloaded at first run via Hugging Face cache.
+# First build is slow (neutts + torch); rebuilds use pip cache and are much faster.
 
 FROM python:3.12-slim
 
@@ -9,16 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     wget \
     ca-certificates \
+    build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-# neutts (no [llama] here to avoid pulling source build)
-RUN pip install --no-cache-dir -r requirements.txt
-# Pre-built CPU wheel — no gcc/cmake, no compile (fast)
-RUN pip install --no-cache-dir llama-cpp-python \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# neutts (no [llama] here to avoid pulling source build). Cache pip so rebuilds are fast.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+# Build llama-cpp-python from source (CPU only). Abetlen wheels are musl-only; we need glibc (Debian).
+# Use --no-binary to force source build and avoid musl wheels.
+RUN pip install llama-cpp-python --no-cache-dir --no-binary llama-cpp-python -v
 
 # Reference voices: English (dave), French (juliette). If wget fails, mount /app/samples at run.
 RUN mkdir -p /app/samples \

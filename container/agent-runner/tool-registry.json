@@ -82,13 +82,24 @@
     },
     {
       "name": "WebFetch",
-      "description": "Fetch a URL and return its text content (HTML stripped).",
+      "description": "Fetch a URL and return its text content (HTML stripped). Use for static pages without JavaScript interactions.",
       "parameters": {
         "type": "object",
         "properties": {
           "url": { "type": "string", "description": "URL to fetch" }
         },
         "required": ["url"]
+      }
+    },
+    {
+      "name": "agent-browser",
+      "description": "Full browser automation for JavaScript-heavy sites, logins, and interactions. Use Bash with agent-browser commands to: open URLs, take screenshots, click elements, fill forms. Requires using Bash(command: 'agent-browser ...').",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "Agent-browser command to run via Bash: open <url>, snapshot, snapshot -i, click @e1, fill @e2 'text', get text @e1, screenshot file.png, close" }
+        },
+        "required": ["command"]
       }
     },
     {
@@ -100,11 +111,12 @@
           "text": { "type": "string", "description": "Message text to send" }
         },
         "required": ["text"]
-      }
+      },
+      "alwaysRequired": true
     },
     {
       "name": "send_voice",
-      "description": "Send a WhatsApp voice note (spoken audio). REQUIRED when the user asks for audio, a voice note, or to hear something spoken — call this with the content; do not reply with text only. Also use when the user sent a voice message. Keep text short — under ~200 words.",
+      "description": "Send a WhatsApp voice note (spoken audio). REQUIRED when the user asks for audio, a voice note, or to hear something spoken — call this with the content; do not reply with text only. Also use when the user sent a voice message. Keep text short — under ~200 words. The system delivers the voice note first, then your next message; do not claim 'I sent you a voice note' in that message — use short follow-ups only (e.g. 'Summary above.').",
       "parameters": {
         "type": "object",
         "properties": {
@@ -135,7 +147,8 @@
           "question": { "type": "string", "description": "Clear question or context for the user to respond to" }
         },
         "required": ["question"]
-      }
+      },
+      "alwaysRequired": true
     },
     {
       "name": "schedule_task",
@@ -290,7 +303,7 @@
     }
   ],
   "defaultEnabledNonMain": [
-    "Read", "Glob", "Grep", "WebFetch",
+    "Read", "Glob", "Grep", "WebFetch", "agent-browser",
     "send_message", "send_voice", "send_image", "ask_boss",
     "store_memory", "consult_memory", "memory_search", "submit_plan", "clear_plan",
     "list_workflows", "search_tools", "run_workflow",

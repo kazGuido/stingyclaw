@@ -147,11 +147,37 @@ async function getToolsForContext(
     const results = await semanticToolSearch.searchAsync(query, topK);
     const topKNames = new Set(results.map((r) => r.name));
     const selectedTools = filteredTools.filter((t) => topKNames.has(t.name));
-    log(`[semantic search] ${selectedTools.length} tools: ${results.map((r) => `${r.name}(${r.score.toFixed(2)})`).join(', ')}`);
+    
+    // Always include tools marked as alwaysRequired
+    const alwaysRequiredTools = registry.tools.filter(t => (t as any).alwaysRequired);
+    
+    // Build tool chain: if agent-browser is selected, include send_image
+    const selectedNames = new Set(selectedTools.map(t => t.name));
+    const needsImageTool = selectedNames.has('agent-browser') || selectedNames.has('WebFetch');
+    if (needsImageTool && enabledNames.has('send_image')) {
+      const sendImageTool = registry.tools.find(t => t.name === 'send_image');
+      if (sendImageTool && !selectedNames.has('send_image')) {
+        selectedTools.push(sendImageTool);
+        log(`[semantic search] Added tool chain dependency: send_image`);
+      }
+    }
+    
+    // Add alwaysRequired tools if not already included
+    for (const tool of alwaysRequiredTools) {
+      if (!selectedNames.has(tool.name) && enabledNames.has(tool.name)) {
+        selectedTools.push(tool);
+        log(`[semantic search] Added required tool: ${tool.name}`);
+      }
+    }
+    
+    log(`[semantic search] ${selectedTools.length} tools: ${selectedTools.map((r) => `${r.name}`).join(', ')}`);
     return buildOpenAITools({ tools: selectedTools });
   } catch (err) {
     log(`[semantic search] Fallback: ${(err as Error).message}`);
-    return buildOpenAITools({ tools: filteredTools });
+    // Cap fallback tools to prevent context overflow
+    const fallbackTools = filteredTools.slice(0, 15);
+    log(`[semantic search] Using fallback with ${fallbackTools.length} tools (max 15)`);
+    return buildOpenAITools({ tools: fallbackTools });
   }
 }
 
@@ -402,6 +428,7 @@ Tool: send_voice
     • You want a natural conversational reply (short messages under 150 words)
   How to use: send_voice(text: "short message under 150 words", voice?: "Ryan" | "Aiden" | "Vivian" | "Serena" | "Uncle_Fu" | "Dylan" | "Eric" | "Ono_Anna" | "Sohee" | "French")
   Use voice "French" when the user wants French speech.
+  ORDER: The system sends the voice note first, then your next text. Do NOT say "I've sent you a voice note" or "I sent the audio" in that text — the user will see the audio before your message. Use short follow-ups only, e.g. "Summary above." or "Let me know if you need more."
   WARNING: If you don't call this when user asks for audio, they get NOTHING audible.
 
 Tool: send_image  
@@ -433,24 +460,37 @@ Tool: Bash
   Description: Run shell commands in /workspace/group (timeout: 30s default, max 120s).
   Use for: Quick checks, file operations, running scripts, debugging.
   Example: Bash(command: "ls -la && cat README.md", timeout: 60000)
+  
+  Browser automation: Use Bash to run agent-browser commands:
+    - Bash(command: "agent-browser open https://example.com")
+    - Bash(command: "agent-browser snapshot")   # get page elements with refs @e1, @e2, etc.
+    - Bash(command: "agent-browser snapshot -i")  # interactive snapshot
+    - Bash(command: "agent-browser click @e1")
+    - Bash(command: "agent-browser fill @e2 'text'")
+    - Bash(command: "agent-browser get text @e1")
+    - Bash(command: "agent-browser screenshot file.png")
+    - Bash(command: "agent-browser close")
 
 Tool: Read, Glob, Grep
   Description: Read files, find files by pattern, search file contents with rg (ripgrep).
   Use for: Understanding codebases, finding files, searching for patterns.
   Example: Grep(pattern: "TODO", flags: "-i", path: "/workspace/group/src")
 
-Tool: WebFetch, agent-browser
-  Description: Fetch static pages (WebFetch) or full browser (agent-browser for JS, logins, interactions).
-  agent-browser commands:
-    - agent-browser open <url>
-    - agent-browser snapshot          # get page elements with refs @e1, @e2, etc.
-    - agent-browser snapshot -i        # interactive snapshot
-    - agent-browser click @e1
-    - agent-browser fill @e2 "text"
-    - agent-browser get text @e1      # extract text from element
-    - agent-browser screenshot file.png
-    - agent-browser close
-  ALWAYS call send_image("file.png") after screenshot.
+Tool: WebFetch
+  Description: Fetch a URL and return its text content (HTML stripped). Use for static pages.
+
+Tool: agent-browser
+  Description: Full browser automation for JavaScript-heavy sites, logins, and interactions. Use Bash(command: "agent-browser <cmd>") to execute commands.
+  Bash command examples:
+    - Bash(command: "agent-browser open https://example.com")
+    - Bash(command: "agent-browser snapshot")   # get page elements with refs @e1, @e2, etc.
+    - Bash(command: "agent-browser snapshot -i")  # interactive snapshot
+    - Bash(command: "agent-browser click @e1")    # click element
+    - Bash(command: "agent-browser fill @e2 'text'")
+    - Bash(command: "agent-browser get text @e1")
+    - Bash(command: "agent-browser screenshot file.png")  # save screenshot to /workspace/group/file.png
+    - Bash(command: "agent-browser close")
+  After taking a screenshot, ALWAYS call send_image("file.png") to show it to the user.
 
 Tool: submit_plan, store_memory, clear_plan, consult_memory
   Submit an execution plan before multi-step work. Store key facts across turns. Clear the plan when done.
@@ -521,6 +561,14 @@ ${input.isScheduledTask ? '\n\n[SCHEDULED TASK — this is an automated agent ta
   if (planContent) {
     parts.push('\n\n---\nCurrent plan (execute in order, then store_memory and clear_plan):\n' + planContent);
   }
+
+  parts.push(`
+
+=== HISTORY vs CURRENT MESSAGE ===
+The conversation history below contains previous exchanges. The LAST user message in the list is the CURRENT INSTRUCTION you need to respond to.
+All messages before that are HISTORY that provides context but should not be treated as new instructions.
+Focus on responding to the LAST message in the history array.
+`);
 
   return parts.join('');
 }
@@ -786,6 +834,26 @@ async function executeTool(
           .replace(/\s+/g, ' ')
           .trim();
         return cleaned.slice(0, 15000) + (cleaned.length > 15000 ? '\n...(truncated)' : '');
+      }
+
+      case 'agent-browser': {
+        const command = args.command as string;
+        if (!command?.trim()) return 'Error: agent-browser requires a command.';
+        log(`agent-browser: ${command.slice(0, 100)}`);
+        const cmd = `agent-browser ${command}`;
+        try {
+          const { stdout, stderr } = await execAsync(cmd, {
+            timeout: 60000,
+            cwd: '/workspace/group',
+            maxBuffer: 10 * 1024 * 1024,
+          });
+          return [stdout, stderr ? `STDERR:\n${stderr}` : ''].filter(Boolean).join('\n') || '(no output)';
+        } catch (err) {
+          const e = err as { message: string; stdout?: string; stderr?: string; killed?: boolean };
+          if (e.killed) return `Command timed out after 60s`;
+          return [e.stdout, e.stderr ? `STDERR:\n${e.stderr}` : '', `Exit error: ${e.message}`]
+            .filter(Boolean).join('\n');
+        }
       }
 
       case 'send_message': {
@@ -1106,6 +1174,31 @@ function buildConfirmationPreview(name: string, args: Record<string, unknown>): 
   return `About to run: ${name}(${parts.join(', ')}). Reply "yes" to confirm or "no" to cancel.`;
 }
 
+/**
+ * Determine how many prior messages to keep based on prompt content.
+ * For simple messages (greetings, simple questions), keep only recent turns.
+ * For complex tool-related messages, keep more context.
+ */
+function getIdealMessageCount(prompt: string, currentCount: number): number {
+  const simplePatterns = [
+    /^hi|hello|hey|greetings/i, // greetings
+    /^how are you|what's up/i, // small talk
+    /^can you|can i|i can/i, // simple questions
+    /good morning|good afternoon|good evening/i, // time-based greetings
+    /^test|testing/i, // test messages
+  ];
+  
+  const isSimpleMessage = simplePatterns.some(p => p.test(prompt));
+  
+  if (isSimpleMessage) {
+    // For simple messages, 6 messages (3 turns) is enough
+    return Math.min(6, currentCount);
+  } else {
+    // For complex messages, keep up to 10 (5 turns)
+    return Math.min(10, currentCount);
+  }
+}
+
 async function runQuery(
   prompt: string,
   session: Session,
@@ -1124,6 +1217,16 @@ async function runQuery(
   // Use prompt for semantic tool choice only when it's a real user message, not a confirmation reply
   const queryForTools = session.pendingConfirmation ? undefined : (prompt?.trim() || undefined);
   const toolsForContext = await getToolsForContext(registry, input.isMain, queryForTools, 8);
+
+  // Clean up old conversation history to prevent context bleed
+  // Keep only the last 6 messages if stored memory exists, or last 10 if not
+  // This prevents the agent from treating old conversation as current instruction
+  const hasMemory = fs.existsSync(AGENT_MEMORY_PATH);
+  const maxMessagesForHistory = hasMemory ? 6 : 10;
+  if (session.messages.length > maxMessagesForHistory) {
+    log(`Trimming session history from ${session.messages.length} to ${maxMessagesForHistory} messages to prevent context bleed`);
+    session.messages = session.messages.slice(-maxMessagesForHistory);
+  }
 
   // Resuming from confirmation: user replied yes/no; execute or cancel pending tool, then continue loop.
   if (session.pendingConfirmation && prompt) {
@@ -1168,55 +1271,106 @@ async function runQuery(
       hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
         ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
         : session.messages;
-    // Strip provider-specific nulls (refusal, reasoning_details) and empty content
-    // from assistant messages before sending — keeps the history clean regardless of model.
+    // Strip provider-specific fields from assistant messages before sending.
+    // Models like Qwen return reasoning/reasoning_details which are incompatible with OpenAI API format.
+    // Keep only: role, content, and tool_calls (if any). This ensures compatibility with all models.
     const sanitizedMessages = messagesForApi.map((m: any) => {
       if (m.role !== 'assistant') return m;
       const cleaned: any = { role: m.role };
       if (typeof m.content === 'string' && m.content !== '') cleaned.content = m.content;
       if (m.tool_calls?.length) cleaned.tool_calls = m.tool_calls;
+      // Explicitly strip reasoning and reasoning_details that some models return
+      delete cleaned.reasoning;
+      delete cleaned.reasoning_details;
+      delete cleaned.refusal;
       return cleaned;
     });
 
-    let response;
-    try {
-      response = await client.chat.completions.create({
-        model: modelName,
-        messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
-        tools: toolsForContext,
-        tool_choice: 'auto',
-        max_tokens: 8192,
-      });
-    } catch (err: any) {
-      const msg = err?.message ?? '';
-      // On 400 with a long session, trim to last 10 messages and retry once.
-      if (msg.includes('400') && session.messages.length > 10) {
-        log(`API 400 with ${session.messages.length} messages — trimming session to last 10 and retrying`);
-        session.messages = session.messages.slice(-10);
-        saveSession(session);
-        continue;
+    const maxApiRetries = 3;
+    let response: Awaited<ReturnType<typeof client.chat.completions.create>> | undefined;
+    let lastApiError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxApiRetries; attempt++) {
+      try {
+        response = await client.chat.completions.create({
+          model: modelName,
+          messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
+          tools: toolsForContext,
+          tool_choice: 'auto',
+          max_tokens: 8192,
+        });
+      } catch (err: any) {
+        lastApiError = err;
+        const msg = err?.message ?? '';
+        // On 400 with a long session, trim and retry (no delay)
+        if (msg.includes('400') && session.messages.length > 6) {
+          log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
+          session.messages = session.messages.slice(-8);
+          saveSession(session);
+          continue; // retry same iteration of outer loop
+        }
+        // On 5xx (transient), retry with backoff
+        if ((err?.status === 500 || err?.status === 502 || err?.status === 503) || /5\d{2}/.test(String(err?.status ?? '')) || msg.includes('500') || msg.includes('502') || msg.includes('503')) {
+          if (attempt < maxApiRetries) {
+            const delayMs = Math.min(2000 * attempt, 8000);
+            log(`API 5xx (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
+            await new Promise((r) => setTimeout(r, delayMs));
+            continue;
+          }
+        }
+        throw err;
       }
-      throw err;
+
+      // Response body can contain error even with 200 (e.g. OpenRouter)
+      if (!response?.choices?.length) {
+        const errBody = (response as any)?.error;
+        const code = errBody?.code ?? errBody?.status;
+        const is5xx = code >= 500 && code < 600;
+        if (is5xx && attempt < maxApiRetries) {
+          const delayMs = Math.min(2000 * attempt, 8000);
+          log(`API returned no choices (${code}) (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        const errMsg = `API returned no choices: ${JSON.stringify((response as any)?.choices ?? (response as any)?.error ?? response ?? 'null').slice(0, 250)}`;
+        log(errMsg);
+        throw new Error(errMsg);
+      }
+
+      break; // success
     }
 
-    const choice = response.choices[0];
-    const msg = choice.message;
-    session.messages.push(msg);
-
-    if (msg.content?.trim()) {
-      lastText = msg.content.trim();
+    type CompletionChoice = { message?: OpenAI.ChatCompletionMessageParam; finish_reason?: string };
+    const completion = response as { choices?: CompletionChoice[] };
+    if (!completion?.choices?.length) {
+      throw lastApiError || new Error('API returned no choices after retries');
     }
 
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
+    const choice = completion.choices[0];
+    const msg = choice?.message;
+    if (!msg) {
+      const errMsg = `API choice has no message: finish_reason=${choice?.finish_reason}`;
+      log(errMsg);
+      throw new Error(errMsg);
+    }
+    session.messages.push(msg as OpenAI.ChatCompletionMessageParam);
+
+    type AssistantMsg = { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
+    const assistantMsg = msg as AssistantMsg;
+    if (typeof assistantMsg.content === 'string' && assistantMsg.content.trim()) {
+      lastText = assistantMsg.content.trim();
+    }
+
+    const hasToolCalls = assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0;
 
     if (!hasToolCalls || choice.finish_reason === 'stop') {
       log(`Query complete. finish_reason=${choice.finish_reason}`);
       break;
     }
 
-    log(`Executing ${msg.tool_calls!.length} tool call(s)`);
+    log(`Executing ${assistantMsg.tool_calls!.length} tool call(s)`);
     const sessionRef: SessionRef = { session };
-    for (const toolCall of msg.tool_calls!) {
+    for (const toolCall of assistantMsg.tool_calls!) {
       let args: Record<string, unknown>;
       try {
         args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
@@ -1373,8 +1527,19 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     const e = err as Error;
-    log(`Fatal: ${e.message}`);
-    writeOutput({ status: 'error', result: null, newSessionId: session.id, error: e.message });
+    const msg = e.message ?? String(err);
+    log(`Fatal: ${msg}`);
+    // Provider 500: do not exit(1) so host won't retry 5 times. Send one clear message.
+    if (/500|502|503|Internal Server Error|no choices/.test(msg)) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: session.id,
+        error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily unavailable. Please try again in a few minutes.',
+      });
+      process.exit(0);
+    }
+    writeOutput({ status: 'error', result: null, newSessionId: session.id, error: msg });
     process.exit(1);
   }
 }
