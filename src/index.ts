@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 
 import {
   ASSISTANT_NAME,
@@ -27,12 +28,14 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  setMessagePipelineStateBulk,
   setRegisteredGroup,
   setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
+import { ensureConfigContract } from './config-contract.js';
 import { GroupQueue, MAX_RETRIES } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { flushMessagesForGroup, startIpcWatcher } from './ipc.js';
@@ -78,6 +81,19 @@ function saveState(): void {
     'last_agent_timestamp',
     JSON.stringify(lastAgentTimestamp),
   );
+}
+
+function outboundKey(
+  chatJid: string,
+  runId: string,
+  stage: string,
+  payload: string,
+): string {
+  const hash = createHash('sha256')
+    .update(`${chatJid}|${runId}|${stage}|${payload}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `out:${stage}:${hash}`;
 }
 
 const HARD_RESET_CLAW = '[HARD_RESET_CLAW]';
@@ -190,6 +206,11 @@ function handleNewMessagesForGroup(chatJid: string): void {
     ASSISTANT_NAME,
   );
   if (allPending.length === 0) return;
+  setMessagePipelineStateBulk(
+    chatJid,
+    allPending.map((m) => m.id),
+    'queued',
+  );
 
   if (handleHardResetCodewords(chatJid, group, allPending, channel)) return;
 
@@ -271,6 +292,9 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   }
 
   const prompt = formatMessages(missedMessages);
+  const pipelineMessageIds = missedMessages.map((m) => m.id);
+  const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'running', runId);
 
   // Enforce voice reply when user sent a voice message
   const lastUserMessageWasVoice = missedMessages.some(
@@ -303,12 +327,25 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let ipcSentToCurrentChat = false;
+  let pipelineSentMarked = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.status === 'confirmation_required' && result.confirmationPreview) {
-      await channel.sendMessage(chatJid, result.confirmationPreview);
+      await channel.sendMessage(chatJid, result.confirmationPreview, {
+        idempotencyKey: outboundKey(
+          chatJid,
+          runId,
+          'confirmation',
+          result.confirmationPreview,
+        ),
+      });
       outputSentToUser = true;
+      if (!pipelineSentMarked) {
+        setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'sent', runId);
+        pipelineSentMarked = true;
+      }
       resetIdleTimer();
       // Do not notifyIdle: container is waiting for user reply
       return;
@@ -317,32 +354,67 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     if (result.result) {
       // Flush pending IPC (voice, message, image) before sending any conclusive text.
       // Ensures audio is delivered first when agent uses send_voice + text follow-up.
-      await flushMessagesForGroup(group.folder);
+      const firstFlush = await flushMessagesForGroup(group.folder);
       // Brief wait then flush again — container may write IPC slightly after stdout.
       await new Promise((r) => setTimeout(r, 400));
-      await flushMessagesForGroup(group.folder);
+      const secondFlush = await flushMessagesForGroup(group.folder);
+      const sentViaIpc =
+        (firstFlush.sentByChat[chatJid] || 0) + (secondFlush.sentByChat[chatJid] || 0);
+      if (sentViaIpc > 0) {
+        ipcSentToCurrentChat = true;
+        if (!pipelineSentMarked) {
+          setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'sent', runId);
+          pipelineSentMarked = true;
+        }
+      }
 
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        // Enforce voice reply when user sent voice: send text as voice note instead of plain text
-        if (lastUserMessageWasVoice && channel.sendVoice) {
-          const audio = await synthesizeSpeech(text);
-          if (audio) {
-            await channel.sendVoice(chatJid, audio);
-            outputSentToUser = true;
+        if (ipcSentToCurrentChat) {
+          // If tool-side IPC already sent output to this chat in this run, suppress
+          // auto-send to avoid duplicate user-visible replies.
+          logger.info(
+            { group: group.name, chatJid },
+            'Suppressing auto-send because IPC already sent output for this chat',
+          );
+          outputSentToUser = true;
+        } else {
+          // Enforce voice reply when user sent voice: send text as voice note instead of plain text
+          if (lastUserMessageWasVoice && channel.sendVoice) {
+            const audio = await synthesizeSpeech(text);
+            if (audio) {
+              await channel.sendVoice(chatJid, audio, {
+                idempotencyKey: outboundKey(chatJid, runId, 'voice-final', text),
+              });
+              outputSentToUser = true;
+            } else {
+              await channel.sendMessage(
+                chatJid,
+                `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${text}`,
+                {
+                  idempotencyKey: outboundKey(
+                    chatJid,
+                    runId,
+                    'voice-fallback',
+                    text,
+                  ),
+                },
+              );
+              outputSentToUser = true;
+            }
           } else {
-            await channel.sendMessage(
-              chatJid,
-              `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${text}`,
-            );
+            await channel.sendMessage(chatJid, text, {
+              idempotencyKey: outboundKey(chatJid, runId, 'text-final', text),
+            });
             outputSentToUser = true;
           }
-        } else {
-          await channel.sendMessage(chatJid, text);
-          outputSentToUser = true;
+          if (!pipelineSentMarked) {
+            setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'sent', runId);
+            pipelineSentMarked = true;
+          }
         }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -366,6 +438,13 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
+      setMessagePipelineStateBulk(
+        chatJid,
+        pipelineMessageIds,
+        'committed',
+        runId,
+        output.error,
+      );
       return { ok: true };
     }
     const noRetry = output.noRetry === true;
@@ -373,12 +452,21 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       lastAgentTimestamp[chatJid] = previousCursor;
       saveState();
       logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+      setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'queued', runId, output.error);
     } else {
       saveState();
+      setMessagePipelineStateBulk(
+        chatJid,
+        pipelineMessageIds,
+        'committed',
+        runId,
+        output.error,
+      );
     }
     return { ok: false, error: output.error, noRetry };
   }
 
+  setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'committed', runId);
   return { ok: true };
 }
 
@@ -518,19 +606,24 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
-const LOCK_FILE = path.join(DATA_DIR, '.nanoclaw.lock');
+const LOCK_FILE = path.join(DATA_DIR, '.stingyclaw.lock');
 
 function acquireProcessLock(): boolean {
   try {
     fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
     const pid = process.pid.toString();
-    if (fs.existsSync(LOCK_FILE)) {
-      const existing = fs.readFileSync(LOCK_FILE, 'utf-8').trim();
+    const lockPath = fs.existsSync(LOCK_FILE) ? LOCK_FILE : null;
+
+    if (lockPath) {
+      const existing = fs.readFileSync(lockPath, 'utf-8').trim();
       const existingPid = parseInt(existing, 10);
       if (!Number.isNaN(existingPid)) {
         try {
           process.kill(existingPid, 0);
-          logger.warn({ existingPid }, 'Another stingyclaw instance appears to be running (lock file exists). Exiting.');
+          logger.warn(
+            { existingPid, lockPath },
+            'Another stingyclaw instance appears to be running (lock file exists). Exiting.',
+          );
           return false;
         } catch {
           /* process not running, we can take the lock */
@@ -547,6 +640,7 @@ function acquireProcessLock(): boolean {
 }
 
 async function main(): Promise<void> {
+  ensureConfigContract(process.cwd());
   if (!acquireProcessLock()) {
     process.exit(1);
   }
@@ -600,22 +694,22 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, text, options) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      return channel.sendMessage(jid, text, options);
     },
-    sendVoice: (jid, audioBuffer) => {
+    sendVoice: (jid, audioBuffer, options) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       if (!channel.sendVoice) throw new Error(`Channel ${channel.name} does not support voice`);
-      return channel.sendVoice(jid, audioBuffer);
+      return channel.sendVoice(jid, audioBuffer, options);
     },
-    sendImage: (jid, imageBuffer, caption) => {
+    sendImage: (jid, imageBuffer, caption, options) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       if (!channel.sendImage) throw new Error(`Channel ${channel.name} does not support images`);
-      return channel.sendImage(jid, imageBuffer, caption);
+      return channel.sendImage(jid, imageBuffer, caption, options);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -635,7 +729,9 @@ async function main(): Promise<void> {
     const msg = error?.includes('temporarily unavailable')
       ? errorText
       : `⚠️ ${errorText}\n\nSend another message to retry.`;
-    channel.sendMessage(groupJid, msg).catch((err) =>
+    channel.sendMessage(groupJid, msg, {
+      idempotencyKey: outboundKey(groupJid, `max-retries-${Date.now()}`, 'error', msg),
+    }).catch((err) =>
       logger.error({ groupJid, err }, 'Failed to send error notification'),
     );
   });

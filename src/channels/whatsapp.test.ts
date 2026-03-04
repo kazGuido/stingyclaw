@@ -25,6 +25,9 @@ vi.mock('../db.js', () => ({
   getLastGroupSync: vi.fn(() => null),
   setLastGroupSync: vi.fn(),
   updateChatName: vi.fn(),
+  registerOutboundDelivery: vi.fn(() => true),
+  markOutboundDeliverySent: vi.fn(),
+  markOutboundDeliveryFailed: vi.fn(),
 }));
 
 // Mock fs
@@ -96,7 +99,13 @@ vi.mock('@whiskeysockets/baileys', () => {
 });
 
 import { WhatsAppChannel, WhatsAppChannelOpts } from './whatsapp.js';
-import { getLastGroupSync, updateChatName, setLastGroupSync } from '../db.js';
+import {
+  getLastGroupSync,
+  markOutboundDeliverySent,
+  registerOutboundDelivery,
+  setLastGroupSync,
+  updateChatName,
+} from '../db.js';
 
 // --- Test helpers ---
 
@@ -668,6 +677,21 @@ describe('WhatsAppChannel', () => {
   // --- Outgoing message queue ---
 
   describe('outgoing message queue', () => {
+    it('skips duplicate sends with same idempotency key', async () => {
+      vi.mocked(registerOutboundDelivery)
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(false);
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.sendMessage('test@g.us', 'Hello', { idempotencyKey: 'k-1' });
+      await channel.sendMessage('test@g.us', 'Hello', { idempotencyKey: 'k-1' });
+
+      expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(markOutboundDeliverySent)).toHaveBeenCalledWith('k-1');
+    });
+
     it('sends message directly when connected', async () => {
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
@@ -734,6 +758,25 @@ describe('WhatsAppChannel', () => {
       expect(fakeSocket.sendMessage).toHaveBeenNthCalledWith(1, 'test@g.us', { text: 'Andy: First' });
       expect(fakeSocket.sendMessage).toHaveBeenNthCalledWith(2, 'test@g.us', { text: 'Andy: Second' });
       expect(fakeSocket.sendMessage).toHaveBeenNthCalledWith(3, 'test@g.us', { text: 'Andy: Third' });
+    });
+
+    it('keeps queued message for retry if flush send fails', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await channel.sendMessage('test@g.us', 'Retry me');
+      fakeSocket.sendMessage.mockRejectedValueOnce(new Error('Network down'));
+
+      await connectChannel(channel);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // One failed flush attempt while connected.
+      expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(1);
+
+      // Next flush succeeds and sends exactly once more.
+      fakeSocket.sendMessage.mockResolvedValueOnce(undefined);
+      await (channel as any).flushOutgoingQueue();
+      expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(2);
     });
   });
 

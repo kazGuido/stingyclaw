@@ -176,7 +176,7 @@ export async function applyUpdate(newCorePath: string): Promise<UpdateResult> {
       const oursContent = fs.readFileSync(currentPath, 'utf-8');
       const tmpCurrent = path.join(
         os.tmpdir(),
-        `nanoclaw-update-${crypto.randomUUID()}-${path.basename(relPath)}`,
+        `stingyclaw-update-${crypto.randomUUID()}-${path.basename(relPath)}`,
       );
       fs.copyFileSync(currentPath, tmpCurrent);
 

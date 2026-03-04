@@ -9,6 +9,13 @@ import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.
 
 let db: Database.Database;
 
+export type MessagePipelineState =
+  | 'received'
+  | 'queued'
+  | 'running'
+  | 'sent'
+  | 'committed';
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -77,6 +84,59 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS kb_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_kb_group ON kb_entries(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_kb_title ON kb_entries(title);
+
+    CREATE TABLE IF NOT EXISTS group_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT DEFAULT 'pending',
+      due_date TEXT,
+      type TEXT DEFAULT 'todo',
+      priority INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_group ON group_tasks(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_tasks_status ON group_tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_tasks_due ON group_tasks(due_date);
+    CREATE INDEX IF NOT EXISTS idx_tasks_type ON group_tasks(type);
+
+    CREATE TABLE IF NOT EXISTS outbound_deliveries (
+      idempotency_key TEXT PRIMARY KEY,
+      chat_jid TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      sent_at TEXT,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_status
+      ON outbound_deliveries(status, created_at);
+
+    CREATE TABLE IF NOT EXISTS message_pipeline (
+      message_id TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      state TEXT NOT NULL,
+      run_id TEXT,
+      last_error TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (message_id, chat_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_pipeline_state
+      ON message_pipeline(state, updated_at);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -251,6 +311,9 @@ export function storeMessage(msg: NewMessage): void {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
   );
+  if (!msg.is_bot_message && !msg.is_from_me) {
+    setMessagePipelineState(msg.chat_jid, msg.id, 'received');
+  }
 }
 
 /**
@@ -278,6 +341,134 @@ export function storeMessageDirect(msg: {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
   );
+  if (!msg.is_bot_message && !msg.is_from_me) {
+    setMessagePipelineState(msg.chat_jid, msg.id, 'received');
+  }
+}
+
+export function registerOutboundDelivery(
+  idempotencyKey: string,
+  chatJid: string,
+  kind: 'message' | 'voice' | 'image',
+): boolean {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    `
+    INSERT OR IGNORE INTO outbound_deliveries
+      (idempotency_key, chat_jid, kind, status, created_at)
+    VALUES (?, ?, ?, 'pending', ?)
+  `,
+  ).run(idempotencyKey, chatJid, kind, now);
+
+  if (result.changes > 0) return true;
+
+  const existing = db
+    .prepare(
+      'SELECT status FROM outbound_deliveries WHERE idempotency_key = ?',
+    )
+    .get(idempotencyKey) as { status: string } | undefined;
+
+  if (existing?.status === 'failed') {
+    db.prepare(
+      `
+      UPDATE outbound_deliveries
+      SET status = 'pending', last_error = NULL
+      WHERE idempotency_key = ?
+    `,
+    ).run(idempotencyKey);
+    return true;
+  }
+
+  return false;
+}
+
+export function markOutboundDeliverySent(idempotencyKey: string): void {
+  db.prepare(
+    `
+    UPDATE outbound_deliveries
+    SET status = 'sent', sent_at = ?, last_error = NULL
+    WHERE idempotency_key = ?
+  `,
+  ).run(new Date().toISOString(), idempotencyKey);
+}
+
+export function markOutboundDeliveryFailed(
+  idempotencyKey: string,
+  error: string,
+): void {
+  db.prepare(
+    `
+    UPDATE outbound_deliveries
+    SET status = 'failed', last_error = ?
+    WHERE idempotency_key = ?
+  `,
+  ).run(error.slice(0, 400), idempotencyKey);
+}
+
+export function setMessagePipelineState(
+  chatJid: string,
+  messageId: string,
+  state: MessagePipelineState,
+  runId?: string,
+  lastError?: string,
+): void {
+  db.prepare(
+    `
+    INSERT INTO message_pipeline (message_id, chat_jid, state, run_id, last_error, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(message_id, chat_jid) DO UPDATE SET
+      state = excluded.state,
+      run_id = excluded.run_id,
+      last_error = excluded.last_error,
+      updated_at = excluded.updated_at
+  `,
+  ).run(
+    messageId,
+    chatJid,
+    state,
+    runId || null,
+    lastError || null,
+    new Date().toISOString(),
+  );
+}
+
+export function setMessagePipelineStateBulk(
+  chatJid: string,
+  messageIds: string[],
+  state: MessagePipelineState,
+  runId?: string,
+  lastError?: string,
+): void {
+  for (const messageId of messageIds) {
+    setMessagePipelineState(chatJid, messageId, state, runId, lastError);
+  }
+}
+
+export function getMessagePipelineState(
+  chatJid: string,
+  messageId: string,
+): {
+  message_id: string;
+  chat_jid: string;
+  state: MessagePipelineState;
+  run_id: string | null;
+  last_error: string | null;
+  updated_at: string;
+} | undefined {
+  return db
+    .prepare(
+      'SELECT * FROM message_pipeline WHERE chat_jid = ? AND message_id = ?',
+    )
+    .get(chatJid, messageId) as
+    | {
+        message_id: string;
+        chat_jid: string;
+        state: MessagePipelineState;
+        run_id: string | null;
+        last_error: string | null;
+        updated_at: string;
+      }
+    | undefined;
 }
 
 export function getNewMessages(
@@ -697,4 +888,150 @@ function migrateJsonState(): void {
       }
     }
   }
+}
+
+// --- KB entries accessors (group scoped) ---
+
+export interface KBEntry {
+  id: number;
+  group_folder: string;
+  title: string;
+  content: string;
+  tags?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function addKBEntry(groupFolder: string, title: string, content: string, tags?: string): number {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    `INSERT INTO kb_entries (group_folder, title, content, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(groupFolder, title, content, tags || null, now, now);
+  return result.lastInsertRowid as number;
+}
+
+export function updateKBEntry(id: number, title: string, content: string, tags?: string): boolean {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    `UPDATE kb_entries SET title = ?, content = ?, tags = ?, updated_at = ? WHERE id = ?`,
+  ).run(title, content, tags || null, now, id);
+  return result.changes > 0;
+}
+
+export function deleteKBEntry(id: number): boolean {
+  const result = db.prepare(`DELETE FROM kb_entries WHERE id = ?`).run(id);
+  return result.changes > 0;
+}
+
+export function getKBEntry(id: number): KBEntry | undefined {
+  const row = db
+    .prepare('SELECT * FROM kb_entries WHERE id = ?')
+    .get(id) as KBEntry | undefined;
+  return row;
+}
+
+export function getKBEntriesByGroup(groupFolder: string): KBEntry[] {
+  return db
+    .prepare('SELECT * FROM kb_entries WHERE group_folder = ? ORDER BY updated_at DESC')
+    .all(groupFolder) as KBEntry[];
+}
+
+export function searchKBEntries(groupFolder: string, query: string): KBEntry[] {
+  const term = `%${query}%`;
+  return db
+    .prepare(`
+      SELECT * FROM kb_entries 
+      WHERE group_folder = ? 
+        AND (title LIKE ? OR content LIKE ?)
+      ORDER BY updated_at DESC
+    `)
+    .all(groupFolder, term, term) as KBEntry[];
+}
+
+// --- Group tasks accessors (group scoped) ---
+
+export interface GroupTask {
+  id: number;
+  group_folder: string;
+  title: string;
+  description?: string;
+  status: string;
+  due_date?: string;
+  type: string;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export function addGroupTask(groupFolder: string, title: string, description?: string, status = 'pending', dueDate?: string, type = 'todo', priority = 0): number {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    `INSERT INTO group_tasks (group_folder, title, description, status, due_date, type, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(groupFolder, title, description || null, status, dueDate || null, type, priority, now, now);
+  return result.lastInsertRowid as number;
+}
+
+export function updateGroupTask(id: number, updates: Partial<Pick<GroupTask, 'title' | 'description' | 'status' | 'due_date' | 'type' | 'priority'>>): boolean {
+  const now = new Date().toISOString();
+  const sets: string[] = [];
+  const values: any[] = [];
+  const allowedKeys: ReadonlyArray<keyof typeof updates> = ['title', 'description', 'status', 'due_date', 'type', 'priority'];
+  for (const key of Object.keys(updates) as Array<keyof typeof updates>) {
+    if (allowedKeys.includes(key) && updates[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      values.push(updates[key]);
+    }
+  }
+  if (sets.length === 0) return false;
+  values.push(now);
+  values.push(id);
+  sets.push('updated_at = ?');
+  const result = db.prepare(
+    `UPDATE group_tasks SET ${sets.join(', ')} WHERE id = ?`,
+  ).run(...values);
+  return result.changes > 0;
+}
+
+export function deleteGroupTask(id: number): boolean {
+  const result = db.prepare(`DELETE FROM group_tasks WHERE id = ?`).run(id);
+  return result.changes > 0;
+}
+
+export function getGroupTask(id: number): GroupTask | undefined {
+  const row = db
+    .prepare('SELECT * FROM group_tasks WHERE id = ?')
+    .get(id) as GroupTask | undefined;
+  return row;
+}
+
+export function getGroupTasksByGroup(groupFolder: string): GroupTask[] {
+  return db
+    .prepare('SELECT * FROM group_tasks WHERE group_folder = ? ORDER BY created_at DESC')
+    .all(groupFolder) as GroupTask[];
+}
+
+export function getGroupTasksByStatus(groupFolder: string, status: string): GroupTask[] {
+  return db
+    .prepare('SELECT * FROM group_tasks WHERE group_folder = ? AND status = ? ORDER BY created_at DESC')
+    .all(groupFolder, status) as GroupTask[];
+}
+
+export function getGroupTasksByDueDate(groupFolder: string, beforeDate: string): GroupTask[] {
+  return db
+    .prepare('SELECT * FROM group_tasks WHERE group_folder = ? AND due_date <= ? AND status != \'done\' ORDER BY due_date ASC')
+    .all(groupFolder, beforeDate) as GroupTask[];
+}
+
+export function getGroupTasksByType(groupFolder: string, type: string): GroupTask[] {
+  return db
+    .prepare('SELECT * FROM group_tasks WHERE group_folder = ? AND type = ? ORDER BY created_at DESC')
+    .all(groupFolder, type) as GroupTask[];
+}
+
+export function deleteAllGroupTasksForGroup(groupFolder: string): void {
+  db.prepare('DELETE FROM group_tasks WHERE group_folder = ?').run(groupFolder);
+}
+
+export function deleteAllKBEntriesForGroup(groupFolder: string): void {
+  db.prepare('DELETE FROM kb_entries WHERE group_folder = ?').run(groupFolder);
 }

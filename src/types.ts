@@ -52,6 +52,10 @@ export interface NewMessage {
   is_bot_message?: boolean;
 }
 
+export interface OutboundSendOptions {
+  idempotencyKey?: string;
+}
+
 export interface ScheduledTask {
   id: string;
   group_folder: string;
@@ -81,11 +85,11 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, options?: OutboundSendOptions): Promise<void>;
   // Optional: send a voice note (OGG Opus buffer as WhatsApp PTT).
-  sendVoice?(jid: string, audioBuffer: Buffer): Promise<void>;
+  sendVoice?(jid: string, audioBuffer: Buffer, options?: OutboundSendOptions): Promise<void>;
   // Optional: send an image (buffer + optional caption).
-  sendImage?(jid: string, imageBuffer: Buffer, caption?: string): Promise<void>;
+  sendImage?(jid: string, imageBuffer: Buffer, caption?: string, options?: OutboundSendOptions): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

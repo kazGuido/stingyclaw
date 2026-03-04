@@ -4,11 +4,16 @@ import {
   _initTestDatabase,
   createTask,
   deleteTask,
+  getMessagePipelineState,
   getAllChats,
   getMessagesSince,
   getNewMessages,
   getRecentMessages,
   getTaskById,
+  markOutboundDeliveryFailed,
+  markOutboundDeliverySent,
+  registerOutboundDelivery,
+  setMessagePipelineStateBulk,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -120,6 +125,63 @@ describe('storeMessage', () => {
     const messages = getMessagesSince('group@g.us', '2024-01-01T00:00:00.000Z', 'Andy');
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
+  });
+
+  it('creates pipeline state=received for inbound non-bot messages', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    store({
+      id: 'pipe-1',
+      chat_jid: 'group@g.us',
+      sender: '123@s.whatsapp.net',
+      sender_name: 'Alice',
+      content: 'hello',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    const row = getMessagePipelineState('group@g.us', 'pipe-1');
+    expect(row?.state).toBe('received');
+  });
+});
+
+describe('message pipeline state machine', () => {
+  it('transitions received -> queued -> running -> sent -> committed', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    store({
+      id: 'msg-p1',
+      chat_jid: 'group@g.us',
+      sender: 'u@s.whatsapp.net',
+      sender_name: 'U',
+      content: 'hello',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+
+    setMessagePipelineStateBulk('group@g.us', ['msg-p1'], 'queued');
+    expect(getMessagePipelineState('group@g.us', 'msg-p1')?.state).toBe('queued');
+
+    setMessagePipelineStateBulk('group@g.us', ['msg-p1'], 'running', 'run-1');
+    expect(getMessagePipelineState('group@g.us', 'msg-p1')?.state).toBe('running');
+
+    setMessagePipelineStateBulk('group@g.us', ['msg-p1'], 'sent', 'run-1');
+    expect(getMessagePipelineState('group@g.us', 'msg-p1')?.state).toBe('sent');
+
+    setMessagePipelineStateBulk('group@g.us', ['msg-p1'], 'committed', 'run-1');
+    expect(getMessagePipelineState('group@g.us', 'msg-p1')?.state).toBe('committed');
+  });
+});
+
+describe('outbound idempotency', () => {
+  it('allows first send intent and suppresses duplicate keys', () => {
+    const first = registerOutboundDelivery('k-1', 'group@g.us', 'message');
+    const duplicate = registerOutboundDelivery('k-1', 'group@g.us', 'message');
+    expect(first).toBe(true);
+    expect(duplicate).toBe(false);
+  });
+
+  it('allows retry after a failed send record', () => {
+    expect(registerOutboundDelivery('k-2', 'group@g.us', 'message')).toBe(true);
+    markOutboundDeliveryFailed('k-2', 'network error');
+    expect(registerOutboundDelivery('k-2', 'group@g.us', 'message')).toBe(true);
+    markOutboundDeliverySent('k-2');
+    expect(registerOutboundDelivery('k-2', 'group@g.us', 'message')).toBe(false);
   });
 });
 

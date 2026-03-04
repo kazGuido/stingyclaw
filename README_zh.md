@@ -11,7 +11,7 @@
 
 ## 故事起源
 
-[NanoClaw](https://github.com/qwibitai/nanoclaw) 是个精妙的小项目：一个住在 WhatsApp 里的 AI 助手，在 Docker 容器中运行，用 Claude 来做推理。问题在哪？Claude 要钱。真金白银的钱。而且它用的是 Anthropic 的专有 SDK，把你死死锁在他们的生态里。
+[上游项目](https://github.com/qwibitai/nanoclaw) 是个精妙的小项目：一个住在 WhatsApp 里的 AI 助手，在 Docker 容器中运行，用 Claude 来做推理。问题在哪？Claude 要钱。真金白银的钱。而且它用的是 Anthropic 的专有 SDK，把你死死锁在他们的生态里。
 
 **Stingyclaw** 是穷开发者的 Fork。
 
@@ -25,7 +25,7 @@
 
 ## 与上游的主要差异
 
-|  | 上游 NanoClaw | Stingyclaw |
+|  | 上游项目 | Stingyclaw |
 |---|---|---|
 | **模型** | 仅支持 Claude（需要 Anthropic 订阅） | 任意模型：Gemini、OpenRouter、Ollama |
 | **智能体循环** | Anthropic 专有 SDK | 标准 `openai` 包（OpenAI 兼容接口） |
@@ -257,7 +257,7 @@ docker compose build voice
 
 ## 致谢
 
-本 Fork 基于 [NanoClaw](https://github.com/qwibitai/nanoclaw)（qwibitai 出品），采用 MIT 许可证。
+本 Fork 基于[上游项目](https://github.com/qwibitai/nanoclaw)（qwibitai 出品），采用 MIT 许可证。
 原始架构、WhatsApp 集成、IPC 设计和容器隔离模型的全部功劳归属于上游作者。
 
 ## 许可证

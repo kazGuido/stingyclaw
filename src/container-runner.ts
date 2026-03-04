@@ -2,7 +2,7 @@
  * Container Runner for Stingyclaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -247,6 +247,29 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  // Pre-run TypeScript check on canonical agent-runner source (same code we sync into the group and compile in-container).
+  // Fails fast with a clear error instead of container exit code 2 and empty stderr.
+  const agentRunnerDir = path.join(process.cwd(), 'container', 'agent-runner');
+  if (fs.existsSync(path.join(agentRunnerDir, 'tsconfig.json'))) {
+    const tsc = spawnSync('npx', ['tsc', '--noEmit'], {
+      cwd: agentRunnerDir,
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    if (tsc.status !== 0) {
+      const out = (tsc.stderr || tsc.stdout || '').trim().slice(-800);
+      logger.error(
+        { group: group.name, exitCode: tsc.status },
+        'Agent source TypeScript check failed (container would exit 2)',
+      );
+      return Promise.resolve({
+        status: 'error',
+        result: null,
+        error: `Agent source has TypeScript errors. Fix container/agent-runner/src and try again.\n${out}`,
+      });
+    }
+  }
+
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -489,10 +512,15 @@ export async function runContainerAgent(
           'Container exited with error',
         );
 
+        const errSnippet = (stderr || stdout).trim().slice(-500) || '(no output captured)';
+        const code2Hint =
+          code === 2
+            ? ' Exit code 2 usually means the agent TypeScript compile failed in the container; check the full log for details.'
+            : '';
         resolve({
           status: 'error',
           result: null,
-          error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          error: `Container exited with code ${code}: ${errSnippet}${code2Hint} Full log: ${logFile}`,
         });
         return;
       }

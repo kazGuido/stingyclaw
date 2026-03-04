@@ -115,7 +115,7 @@ describe('apply', () => {
 
   it('does not allow path_remap symlink targets to write outside project root', async () => {
     const outsideDir = fs.mkdtempSync(
-      path.join(path.dirname(tmpDir), 'nanoclaw-remap-outside-'),
+      path.join(path.dirname(tmpDir), 'stingyclaw-remap-outside-'),
     );
     const linkPath = path.join(tmpDir, 'link-out');
 

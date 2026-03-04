@@ -68,6 +68,43 @@ Create `tools-enabled.json` in each group's folder:
 
 ---
 
+---
+
+## Investigation: Container Exit Code 2 When Requesting Audio
+
+### What you saw
+- "Agent failed after 5 retries" with last error: `Container exited with code 2: ` (empty stderr).
+- You were requesting audio (e.g. "send an audio presenting Tulande Online").
+
+### Root cause (verified from logs)
+- The failing runs were for group **tulandeclaw-test**, not main. Logs are under `groups/tulandeclaw-test/logs/`.
+- In those logs, **Stdout** contained the real error (tsc wrote to stdout in the old entrypoint):
+  - `src/index.ts(1125,7): error TS1128: Declaration or statement expected.`
+- So **exit code 2** was from the **agent container’s entrypoint**: `npx tsc --outDir /tmp/dist` failed (TypeScript uses exit code 2 for compile errors). The per-group agent-runner source that was mounted had a TS error at line 1125; the container never reached the Node process or any audio logic.
+
+### Why stderr was empty
+- The old entrypoint sent tsc output through a redirect; in practice the diagnostic ended up in stdout, so the host only saw it in the log under "Stdout", and the reported "stderr" snippet was empty.
+
+### Fixes applied
+1. **Error message**  
+   When the container exits non-zero, the host now:
+   - Uses **stdout** when stderr is empty for the snippet.
+   - For exit code 2, adds a hint that it usually means the agent TypeScript compile failed.
+   - Always appends the **full log path** (e.g. `groups/<group>/logs/container-<timestamp>.log`).
+
+2. **Entrypoint (Dockerfile)**  
+   tsc output is written to a file and, on failure, is `cat`’d to stderr before exit so the host always captures the compile error in stderr and in the log.
+
+3. **Pre-run TypeScript check**  
+   Before spawning the container, the host runs `npx tsc --noEmit` in `container/agent-runner`. If it fails, the run is aborted with a clear error and the tsc output, so you no longer get "exit 2" with no explanation.
+
+### What to do if it happens again
+- Open the log path shown in the error (e.g. `groups/tulandeclaw-test/logs/container-<timestamp>.log`).
+- Check **Exit Code**, **Stderr**, and **Stdout**; the compile error will be in one of them.
+- Fix the reported file/line in `container/agent-runner/src` (or ensure no stale/custom copy is used for that group); the next run will either pass the pre-run check or show the same error clearly.
+
+---
+
 ## Testing
 
 Container rebuilt with all fixes. Try:

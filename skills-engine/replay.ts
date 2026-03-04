@@ -193,7 +193,7 @@ export async function replaySkills(
         const oursContent = fs.readFileSync(currentPath, 'utf-8');
         const tmpCurrent = path.join(
           os.tmpdir(),
-          `nanoclaw-replay-${crypto.randomUUID()}-${path.basename(relPath)}`,
+          `stingyclaw-replay-${crypto.randomUUID()}-${path.basename(relPath)}`,
         );
         fs.copyFileSync(currentPath, tmpCurrent);
 

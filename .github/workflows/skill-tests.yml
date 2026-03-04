@@ -52,7 +52,7 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Initialize nanoclaw dir
+      - name: Initialize stingyclaw dir
         run: npx tsx -e "import { initStingyclawDir } from './skills-engine/index.js'; initStingyclawDir();"
 
       - name: Apply skills in sequence

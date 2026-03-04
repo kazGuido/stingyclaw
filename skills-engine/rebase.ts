@@ -196,7 +196,7 @@ export async function rebase(newBasePath?: string): Promise<RebaseResult> {
           // Three-way merge: current(new base) ← old-base → saved(modifications)
           const tmpSaved = path.join(
             os.tmpdir(),
-            `nanoclaw-rebase-${crypto.randomUUID()}-${path.basename(relPath)}`,
+            `stingyclaw-rebase-${crypto.randomUUID()}-${path.basename(relPath)}`,
           );
           fs.writeFileSync(tmpSaved, saved);
 

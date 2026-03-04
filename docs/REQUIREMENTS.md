@@ -6,7 +6,7 @@ Original requirements and design decisions — updated to reflect the current fo
 
 ## Why This Exists
 
-[NanoClaw](https://github.com/qwibitai/nanoclaw) gave us the core: a personal AI assistant that lives in WhatsApp, runs agents in isolated Docker containers, and uses file-based IPC to keep things simple. The problem was it required a paid Anthropic subscription and was locked to Claude via a proprietary SDK.
+[The upstream project](https://github.com/qwibitai/nanoclaw) gave us the core: a personal AI assistant that lives in WhatsApp, runs agents in isolated Docker containers, and uses file-based IPC to keep things simple. The problem was it required a paid Anthropic subscription and was locked to Claude via a proprietary SDK.
 
 **Stingyclaw** removes that dependency entirely. The agent loop is a plain `openai`-package implementation that works with any OpenAI-compatible endpoint — OpenRouter (100+ models, free tiers) or local Ollama. Zero paid API requirements.
 
@@ -166,4 +166,4 @@ A personal AI assistant accessible via WhatsApp, with no paid API requirements a
 
 ## Project Name
 
-**Stingyclaw** — a pun fork of NanoClaw. Stingy because it runs on free API credits.
+**Stingyclaw** — a pun fork of the upstream project. Stingy because it runs on free API credits.

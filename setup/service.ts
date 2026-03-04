@@ -196,6 +196,27 @@ function checkDockerGroupStale(): boolean {
   }
 }
 
+function cleanupLegacySystemdService(systemctlPrefix: string, runningAsRoot: boolean, homeDir: string): void {
+  try {
+    execSync(`${systemctlPrefix} disable --now nanoclaw`, { stdio: 'ignore' });
+    logger.info('Disabled legacy nanoclaw systemd service');
+  } catch {
+    // Legacy unit may not exist
+  }
+
+  const legacyUnitPath = runningAsRoot
+    ? '/etc/systemd/system/nanoclaw.service'
+    : path.join(homeDir, '.config', 'systemd', 'user', 'nanoclaw.service');
+  try {
+    if (fs.existsSync(legacyUnitPath)) {
+      fs.unlinkSync(legacyUnitPath);
+      logger.info({ legacyUnitPath }, 'Removed legacy nanoclaw systemd unit file');
+    }
+  } catch (err) {
+    logger.warn({ err, legacyUnitPath }, 'Could not remove legacy nanoclaw unit file');
+  }
+}
+
 function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): void {
   const runningAsRoot = isRoot();
 
@@ -236,7 +257,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
   }
 
   const voiceExecStartPre = dockerCompose
-    ? `ExecStartPre=${dockerCompose} -f ${projectRoot}/docker-compose.yml up -d voice`
+    ? `ExecStartPre=-/bin/sh -c 'docker start stingyclaw-voice >/dev/null 2>&1 || ${dockerCompose} -f ${projectRoot}/docker-compose.yml up -d voice'`
     : '# Voice service: run "docker compose up -d voice" manually (docker compose not found)';
 
   const unit = `[Unit]
@@ -283,6 +304,9 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
 
   // Kill orphaned stingyclaw processes to avoid WhatsApp conflict errors
   killOrphanedProcesses(projectRoot);
+
+  // Migrate from legacy unit naming to avoid running both services.
+  cleanupLegacySystemdService(systemctlPrefix, runningAsRoot, homeDir);
 
   // Enable and start
   try {

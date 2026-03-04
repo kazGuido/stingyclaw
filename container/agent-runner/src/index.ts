@@ -517,6 +517,20 @@ Tool: schedule_task, list_tasks, pause_task, resume_task, cancel_task
   - list_tasks()
   - pause_task(task_id), resume_task(task_id), cancel_task(task_id)
 
+Tool: kb_add, kb_search, kb_list
+  Knowledge base (group-scoped). Add entries, search by keyword/semantic, list all.
+  - kb_add(title, content, tags)      # Add a new KB entry (e.g., company policy, contact, project brief)
+  - kb_search(query)                  # Search KB entries by keyword/semantic
+  - kb_list()                         # List all KB entries in this group
+
+Tool: add_task, list_tasks, update_task, delete_task
+  Task management (group-scoped). Add tasks, list by status/type, mark done, delete.
+  - add_task(title, description?, due_date?, type?, priority?)  # Add a task (type: todo/meeting/follow_up/reminder)
+  - list_tasks(status?, type?)    # List tasks (filter by status or type)
+  - update_task(task_id, title?, status?, due_date?, priority?)  # Update task
+  - delete_task(task_id)          # Delete a task
+  Example: secretary tasks like "Organize meeting notes", "Follow up on quote", " remind me next Friday".
+
 === WORKFLOW ===
 
 1. User sends message → you analyze what they want
@@ -899,6 +913,211 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         return 'Image sent to chat.';
+      }
+
+      case 'kb_add': {
+        const title = args.title as string;
+        const content = args.content as string;
+        const tags = (args.tags as string | undefined) ?? '';
+        const groupFolder = input.groupFolder;
+        const ipcTaskId = crypto.randomUUID();
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'kb_add',
+          groupFolder,
+          title,
+          content,
+          tags,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_add_${ipcTaskId}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              return `Knowledge base entry created with ID: ${data.id}`;
+            } catch {
+              return 'Error creating KB entry.';
+            }
+          }
+        }
+        return 'KB entry request timed out. Try again.';
+      }
+
+      case 'kb_search': {
+        const query = args.query as string;
+        const groupFolder = input.groupFolder;
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'kb_search',
+          groupFolder,
+          query,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_search_${query.replace(/\s+/g, '_')}_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              if (!data.results || data.results.length === 0) return 'No matching KB entries found.';
+              return data.results
+                .map((r: { id: number; title: string; snippet: string }) => `[${r.id}] ${r.title}\n${r.snippet}`)
+                .join('\n\n');
+            } catch {
+              return 'Error searching KB.';
+            }
+          }
+        }
+        return 'KB search request timed out. Try again.';
+      }
+
+      case 'kb_list': {
+        const groupFolder = input.groupFolder;
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'kb_list',
+          groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_list_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              if (!data.entries || data.entries.length === 0) return 'No KB entries found.';
+              return data.entries
+                .map((e: { id: number; title: string; tags?: string }) => `[${e.id}] ${e.title}${e.tags ? ' (#' + e.tags + ')' : ''}`)
+                .join('\n');
+            } catch {
+              return 'Error listing KB entries.';
+            }
+          }
+        }
+        return 'KB list request timed out. Try again.';
+      }
+
+      case 'add_task': {
+        const title = args.title as string;
+        const description = (args.description as string | undefined) ?? '';
+        const dueDate = (args.due_date as string | undefined) ?? '';
+        const type = (args.type as string | undefined) ?? 'todo';
+        const priority = (args.priority as number | undefined) ?? 0;
+        const groupFolder = input.groupFolder;
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'add_task',
+          groupFolder,
+          title,
+          description,
+          dueDate,
+          taskType: type,
+          priority,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `add_task_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              return `Task created with ID: ${data.id}`;
+            } catch {
+              return 'Error creating task.';
+            }
+          }
+        }
+        return 'Task creation request timed out. Try again.';
+      }
+
+      case 'list_tasks': {
+        const groupFolder = input.groupFolder;
+        const status = (args.status as string | undefined) ?? '';
+        const type = (args.type as string | undefined) ?? '';
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'list_tasks',
+          groupFolder,
+          status,
+          taskType: type,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `list_tasks_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              if (!data.tasks || data.tasks.length === 0) return 'No tasks found.';
+              return data.tasks
+                .map((t: { id: number; title: string; status: string; due_date?: string; type: string }) =>
+                  `[${t.id}] ${t.title} (${t.status})${t.due_date ? ' due ' + t.due_date.split('T')[0] : ''}${t.type !== 'todo' ? ' [' + t.type + ']' : ''}`,
+                )
+                .join('\n');
+            } catch {
+              return 'Error listing tasks.';
+            }
+          }
+        }
+        return 'Task list request timed out. Try again.';
+      }
+
+      case 'update_task': {
+        const taskId = args.task_id as number;
+        const updates: Record<string, any> = {};
+        if (args.title !== undefined) updates.title = args.title as string;
+        if (args.status !== undefined) updates.status = args.status as string;
+        if (args.due_date !== undefined) updates.due_date = args.due_date as string;
+        if (args.priority !== undefined) updates.priority = args.priority as number;
+        const groupFolder = input.groupFolder;
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'update_task',
+          groupFolder,
+          taskId,
+          updates,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `update_task_${taskId}_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              return data.success ? 'Task updated.' : 'Task not found.';
+            } catch {
+              return 'Error updating task.';
+            }
+          }
+        }
+        return 'Task update request timed out. Try again.';
+      }
+
+      case 'delete_task': {
+        const taskId = args.task_id as number;
+        const groupFolder = input.groupFolder;
+        writeIpcFile(IPC_TASKS_DIR, {
+          type: 'delete_task',
+          groupFolder,
+          taskId,
+          timestamp: new Date().toISOString(),
+        });
+        const responsePath = path.join(IPC_RESPONSES_DIR, `delete_task_${taskId}_${crypto.randomUUID()}.json`);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
+          if (fs.existsSync(responsePath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+              fs.unlinkSync(responsePath);
+              return data.success ? 'Task deleted.' : 'Task not found.';
+            } catch {
+              return 'Error deleting task.';
+            }
+          }
+        }
+        return 'Task deletion request timed out. Try again.';
       }
 
       case 'ask_boss': {

@@ -17,12 +17,21 @@ import {
 } from '../whatsapp-version.js';
 import {
   getLastGroupSync,
+  markOutboundDeliveryFailed,
+  markOutboundDeliverySent,
+  registerOutboundDelivery,
   setLastGroupSync,
   updateChatName,
 } from '../db.js';
 import { logger } from '../logger.js';
 import { isAudioMessage, transcribeVoiceMessage } from '../transcription.js';
-import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
+import {
+  Channel,
+  OnInboundMessage,
+  OnChatMetadata,
+  OutboundSendOptions,
+  RegisteredGroup,
+} from '../types.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -52,7 +61,7 @@ export class WhatsAppChannel implements Channel {
   private sock!: WASocket;
   private connected = false;
   private lidToPhoneMap: Record<string, string> = {};
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingQueue: Array<{ jid: string; text: string; idempotencyKey?: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
   private reconnectAttempts = 0;
@@ -274,9 +283,17 @@ export class WhatsAppChannel implements Channel {
     });
   }
 
-  async sendVoice(jid: string, audioBuffer: Buffer): Promise<void> {
+  async sendVoice(jid: string, audioBuffer: Buffer, options?: OutboundSendOptions): Promise<void> {
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey && !registerOutboundDelivery(idempotencyKey, jid, 'voice')) {
+      logger.info({ jid, idempotencyKey }, 'Skipping duplicate voice send by idempotency key');
+      return;
+    }
     if (!this.connected) {
       logger.warn({ jid }, 'WA disconnected, dropping voice message');
+      if (idempotencyKey) {
+        markOutboundDeliveryFailed(idempotencyKey, 'WA disconnected');
+      }
       return;
     }
     try {
@@ -286,12 +303,27 @@ export class WhatsAppChannel implements Channel {
         mimetype: 'audio/ogg; codecs=opus',
       });
       logger.info({ jid, bytes: audioBuffer.length }, 'Voice message sent');
+      if (idempotencyKey) {
+        markOutboundDeliverySent(idempotencyKey);
+      }
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send voice message');
+      if (idempotencyKey) {
+        const msg = err instanceof Error ? err.message : String(err);
+        markOutboundDeliveryFailed(idempotencyKey, msg);
+      }
     }
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, options?: OutboundSendOptions): Promise<void> {
+    const idempotencyKey = options?.idempotencyKey;
+    if (
+      idempotencyKey &&
+      !registerOutboundDelivery(idempotencyKey, jid, 'message')
+    ) {
+      logger.info({ jid, idempotencyKey }, 'Skipping duplicate message send by idempotency key');
+      return;
+    }
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)
     // to distinguish bot output from user messages.
@@ -301,23 +333,39 @@ export class WhatsAppChannel implements Channel {
       : `${ASSISTANT_NAME}: ${text}`;
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text: prefixed });
+      this.outgoingQueue.push({ jid, text: prefixed, idempotencyKey });
       logger.info({ jid, length: prefixed.length, queueSize: this.outgoingQueue.length }, 'WA disconnected, message queued');
       return;
     }
     try {
       await this.sock.sendMessage(jid, { text: prefixed });
       logger.info({ jid, length: prefixed.length }, 'Message sent');
+      if (idempotencyKey) {
+        markOutboundDeliverySent(idempotencyKey);
+      }
     } catch (err) {
       // If send fails, queue it for retry on reconnect
-      this.outgoingQueue.push({ jid, text: prefixed });
+      this.outgoingQueue.push({ jid, text: prefixed, idempotencyKey });
       logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
     }
   }
 
-  async sendImage(jid: string, imageBuffer: Buffer, caption?: string): Promise<void> {
+  async sendImage(
+    jid: string,
+    imageBuffer: Buffer,
+    caption?: string,
+    options?: OutboundSendOptions,
+  ): Promise<void> {
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey && !registerOutboundDelivery(idempotencyKey, jid, 'image')) {
+      logger.info({ jid, idempotencyKey }, 'Skipping duplicate image send by idempotency key');
+      return;
+    }
     if (!this.connected) {
       logger.warn({ jid }, 'WA disconnected, dropping image');
+      if (idempotencyKey) {
+        markOutboundDeliveryFailed(idempotencyKey, 'WA disconnected');
+      }
       return;
     }
     try {
@@ -326,8 +374,15 @@ export class WhatsAppChannel implements Channel {
         caption: caption ? `${ASSISTANT_NAME}: ${caption}` : undefined,
       });
       logger.info({ jid, bytes: imageBuffer.length }, 'Image sent');
+      if (idempotencyKey) {
+        markOutboundDeliverySent(idempotencyKey);
+      }
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send image');
+      if (idempotencyKey) {
+        const msg = err instanceof Error ? err.message : String(err);
+        markOutboundDeliveryFailed(idempotencyKey, msg);
+      }
     }
   }
 
@@ -423,10 +478,19 @@ export class WhatsAppChannel implements Channel {
     try {
       logger.info({ count: this.outgoingQueue.length }, 'Flushing outgoing message queue');
       while (this.outgoingQueue.length > 0) {
-        const item = this.outgoingQueue.shift()!;
+        const item = this.outgoingQueue[0]!;
         // Send directly — queued items are already prefixed by sendMessage
-        await this.sock.sendMessage(item.jid, { text: item.text });
-        logger.info({ jid: item.jid, length: item.text.length }, 'Queued message sent');
+        try {
+          await this.sock.sendMessage(item.jid, { text: item.text });
+          if (item.idempotencyKey) {
+            markOutboundDeliverySent(item.idempotencyKey);
+          }
+          logger.info({ jid: item.jid, length: item.text.length }, 'Queued message sent');
+          this.outgoingQueue.shift();
+        } catch (err) {
+          logger.warn({ jid: item.jid, err }, 'Queued message send failed, will retry later');
+          break;
+        }
       }
     } finally {
       this.flushing = false;

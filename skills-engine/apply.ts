@@ -205,7 +205,7 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
       // git merge-file modifies the first argument in-place, so use a temp copy
       const tmpCurrent = path.join(
         os.tmpdir(),
-        `nanoclaw-merge-${crypto.randomUUID()}-${path.basename(relPath)}`,
+        `stingyclaw-merge-${crypto.randomUUID()}-${path.basename(relPath)}`,
       );
       fs.copyFileSync(currentPath, tmpCurrent);
 

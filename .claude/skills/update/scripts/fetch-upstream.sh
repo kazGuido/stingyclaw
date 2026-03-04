@@ -14,22 +14,29 @@ if git remote get-url upstream &>/dev/null; then
   REMOTE="upstream"
 elif git remote get-url origin &>/dev/null; then
   ORIGIN_URL=$(git remote get-url origin)
-  if echo "$ORIGIN_URL" | grep -q "qwibitai/nanoclaw"; then
+  if echo "$ORIGIN_URL" | grep -q "qwibitai/stingyclaw"; then
     REMOTE="origin"
   fi
 fi
 
 if [ -z "$REMOTE" ]; then
-  echo "No upstream remote found. Adding upstream → https://github.com/qwibitai/nanoclaw.git"
-  git remote add upstream https://github.com/qwibitai/nanoclaw.git
+  echo "No upstream remote found. Adding upstream → https://github.com/qwibitai/stingyclaw.git"
+  git remote add upstream https://github.com/qwibitai/stingyclaw.git
   REMOTE="upstream"
 fi
 
 echo "Fetching from $REMOTE..."
-if ! git fetch "$REMOTE" main 2>&1; then
+UPSTREAM_BRANCH="main"
+if ! git ls-remote --exit-code --heads "$REMOTE" main >/dev/null 2>&1; then
+  if git ls-remote --exit-code --heads "$REMOTE" master >/dev/null 2>&1; then
+    UPSTREAM_BRANCH="master"
+  fi
+fi
+
+if ! git fetch "$REMOTE" "$UPSTREAM_BRANCH" 2>&1; then
   echo "<<< STATUS"
   echo "STATUS=error"
-  echo "ERROR=Failed to fetch from $REMOTE"
+  echo "ERROR=Failed to fetch from $REMOTE/$UPSTREAM_BRANCH"
   echo "STATUS >>>"
   exit 1
 fi
@@ -43,9 +50,9 @@ fi
 # Create temp dir and extract only the paths the skills engine tracks.
 # Read BASE_INCLUDES from the single source of truth in skills-engine/constants.ts,
 # plus always include migrations/ for the migration runner.
-TEMP_DIR=$(mktemp -d /tmp/nanoclaw-update-XXXX)
+TEMP_DIR=$(mktemp -d /tmp/stingyclaw-update-XXXX)
 trap 'rm -rf "$TEMP_DIR"' ERR
-echo "Extracting $REMOTE/main to $TEMP_DIR..."
+echo "Extracting $REMOTE/$UPSTREAM_BRANCH to $TEMP_DIR..."
 
 CANDIDATES=$(node -e "
   const fs = require('fs');
@@ -61,12 +68,12 @@ CANDIDATES=$(node -e "
 # git archive errors if a path doesn't exist, so we check first.
 PATHS=""
 for candidate in $CANDIDATES; do
-  if [ -n "$(git ls-tree --name-only "$REMOTE/main" "$candidate" 2>/dev/null)" ]; then
+  if [ -n "$(git ls-tree --name-only "$REMOTE/$UPSTREAM_BRANCH" "$candidate" 2>/dev/null)" ]; then
     PATHS="$PATHS $candidate"
   fi
 done
 
-git archive "$REMOTE/main" -- $PATHS | tar -x -C "$TEMP_DIR"
+git archive "$REMOTE/$UPSTREAM_BRANCH" -- $PATHS | tar -x -C "$TEMP_DIR"
 
 # Get new version from extracted package.json
 NEW_VERSION="unknown"
@@ -78,6 +85,7 @@ echo ""
 echo "<<< STATUS"
 echo "TEMP_DIR=$TEMP_DIR"
 echo "REMOTE=$REMOTE"
+echo "REMOTE_BRANCH=$UPSTREAM_BRANCH"
 echo "CURRENT_VERSION=$CURRENT_VERSION"
 echo "NEW_VERSION=$NEW_VERSION"
 echo "STATUS=success"

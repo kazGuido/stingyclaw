@@ -13,15 +13,45 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getRecentMessages, getTaskById, updateTask } from './db.js';
+import {
+  addKBEntry,
+  addGroupTask,
+  createTask,
+  deleteGroupTask,
+  deleteTask,
+  getKBEntriesByGroup,
+  getRecentMessages,
+  getTaskById,
+  getGroupTasksByGroup,
+  getGroupTasksByStatus,
+  getGroupTasksByType,
+  GroupTask,
+  searchKBEntries,
+  updateKBEntry,
+  updateGroupTask,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
-  sendVoice: (jid: string, audioBuffer: Buffer) => Promise<void>;
-  sendImage: (jid: string, imageBuffer: Buffer, caption?: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    options?: { idempotencyKey?: string },
+  ) => Promise<void>;
+  sendVoice: (
+    jid: string,
+    audioBuffer: Buffer,
+    options?: { idempotencyKey?: string },
+  ) => Promise<void>;
+  sendImage: (
+    jid: string,
+    imageBuffer: Buffer,
+    caption?: string,
+    options?: { idempotencyKey?: string },
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   clearSession: (groupFolder: string) => void;
@@ -35,23 +65,37 @@ export interface IpcDeps {
   ) => void;
 }
 
+export interface FlushSummary {
+  totalSent: number;
+  sentByChat: Record<string, number>;
+}
+
 let ipcWatcherRunning = false;
 let ipcDeps: IpcDeps | null = null;
 let ipcBaseDir: string = '';
+
+function ipcIdempotencyKey(
+  sourceGroup: string,
+  file: string,
+  kind: 'message' | 'voice' | 'image',
+): string {
+  return `ipc:${sourceGroup}:${kind}:${file}`;
+}
 
 /**
  * Process pending IPC messages (voice, text, image) for a group immediately.
  * Call this before sending the final result so voice is delivered before any follow-up text.
  */
-export async function flushMessagesForGroup(sourceGroup: string): Promise<void> {
+export async function flushMessagesForGroup(sourceGroup: string): Promise<FlushSummary> {
   const deps = ipcDeps;
-  if (!deps || !ipcBaseDir) return;
+  const summary: FlushSummary = { totalSent: 0, sentByChat: {} };
+  if (!deps || !ipcBaseDir) return summary;
 
   const isMain = sourceGroup === MAIN_GROUP_FOLDER;
   const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
   const registeredGroups = deps.registeredGroups();
 
-  if (!fs.existsSync(messagesDir)) return;
+  if (!fs.existsSync(messagesDir)) return summary;
 
   const messageFiles = fs
     .readdirSync(messagesDir)
@@ -80,13 +124,20 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
         if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
           const audio = await synthesizeSpeech(data.text as string, data.voice as string | undefined);
           if (audio) {
-            await deps.sendVoice(chatJid, audio);
+            await deps.sendVoice(chatJid, audio, {
+              idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'voice'),
+            });
+            summary.totalSent++;
+            summary.sentByChat[chatJid] = (summary.sentByChat[chatJid] || 0) + 1;
             logger.info({ chatJid, sourceGroup }, 'IPC voice message sent (flush)');
           } else {
             await deps.sendMessage(
               chatJid,
               `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${data.text as string}`,
+              { idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'message') },
             );
+            summary.totalSent++;
+            summary.sentByChat[chatJid] = (summary.sentByChat[chatJid] || 0) + 1;
             logger.warn({ chatJid }, 'TTS failed, sent as text');
           }
         }
@@ -99,7 +150,14 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
           if (!rel.startsWith('..') && !path.isAbsolute(rel) && fs.existsSync(imagePath)) {
             const imageBuffer = fs.readFileSync(imagePath);
             if (deps.sendImage) {
-              await deps.sendImage(chatJid, imageBuffer, data.caption as string | undefined);
+              await deps.sendImage(
+                chatJid,
+                imageBuffer,
+                data.caption as string | undefined,
+                { idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'image') },
+              );
+              summary.totalSent++;
+              summary.sentByChat[chatJid] = (summary.sentByChat[chatJid] || 0) + 1;
               logger.info({ chatJid, sourceGroup }, 'IPC image sent (flush)');
             }
           }
@@ -107,7 +165,11 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
       } else if (data.type === 'message' && chatJid && data.text) {
         const targetGroup = registeredGroups[chatJid];
         if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-          await deps.sendMessage(chatJid, data.text as string);
+          await deps.sendMessage(chatJid, data.text as string, {
+            idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'message'),
+          });
+          summary.totalSent++;
+          summary.sentByChat[chatJid] = (summary.sentByChat[chatJid] || 0) + 1;
           logger.info({ chatJid, sourceGroup }, 'IPC message sent (flush)');
         }
       }
@@ -123,6 +185,7 @@ export async function flushMessagesForGroup(sourceGroup: string): Promise<void> 
       }
     }
   }
+  return summary;
 }
 
 export function startIpcWatcher(deps: IpcDeps): void {
@@ -181,12 +244,21 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
                   const audio = await synthesizeSpeech(data.text as string, data.voice as string | undefined);
                   if (audio) {
-                    await deps.sendVoice(chatJid, audio);
+                    await deps.sendVoice(chatJid, audio, {
+                      idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'voice'),
+                    });
                     logger.info({ chatJid, sourceGroup }, 'IPC voice message sent');
                   } else {
                     await deps.sendMessage(
                       chatJid,
                       `⚠️ Voice note could not be generated (TTS failed or service unavailable). Sending as text instead:\n\n${data.text as string}`,
+                      {
+                        idempotencyKey: ipcIdempotencyKey(
+                          sourceGroup,
+                          file,
+                          'message',
+                        ),
+                      },
                     );
                     logger.warn({ chatJid }, 'TTS failed, sent as text');
                   }
@@ -204,7 +276,18 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   } else if (fs.existsSync(imagePath)) {
                     const imageBuffer = fs.readFileSync(imagePath);
                     if (deps.sendImage) {
-                      await deps.sendImage(chatJid, imageBuffer, data.caption as string | undefined);
+                      await deps.sendImage(
+                        chatJid,
+                        imageBuffer,
+                        data.caption as string | undefined,
+                        {
+                          idempotencyKey: ipcIdempotencyKey(
+                            sourceGroup,
+                            file,
+                            'image',
+                          ),
+                        },
+                      );
                       logger.info({ chatJid, sourceGroup }, 'IPC image sent');
                     } else {
                       logger.warn({ chatJid }, 'Channel does not support sendImage');
@@ -218,7 +301,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
               } else if (data.type === 'message' && chatJid && data.text) {
                 const targetGroup = registeredGroups[chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  await deps.sendMessage(chatJid, data.text as string);
+                  await deps.sendMessage(chatJid, data.text as string, {
+                    idempotencyKey: ipcIdempotencyKey(sourceGroup, file, 'message'),
+                  });
                   logger.info({ chatJid, sourceGroup }, 'IPC message sent');
                 } else {
                   logger.warn({ chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
@@ -286,7 +371,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
 export async function processTaskIpc(
   data: {
     type: string;
-    taskId?: string;
+    taskId?: string | number;
     prompt?: string;
     schedule_type?: string;
     schedule_value?: string;
@@ -304,6 +389,20 @@ export async function processTaskIpc(
     // For read_messages
     requestId?: string;
     limit?: number;
+    // For kb_add / kb_search
+    title?: string;
+    content?: string;
+    tags?: string;
+    query?: string;
+    // For add_task / update_task / delete_task
+    description?: string;
+    dueDate?: string;
+    taskType?: string;
+    priority?: number;
+    status?: string;
+    updates?: Record<string, string | number>;
+    // Common fields
+    timestamp?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -405,7 +504,7 @@ export async function processTaskIpc(
       break;
 
     case 'pause_task':
-      if (data.taskId) {
+      if (data.taskId && typeof data.taskId === 'string') {
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'paused' });
@@ -423,7 +522,7 @@ export async function processTaskIpc(
       break;
 
     case 'resume_task':
-      if (data.taskId) {
+      if (data.taskId && typeof data.taskId === 'string') {
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'active' });
@@ -441,7 +540,7 @@ export async function processTaskIpc(
       break;
 
     case 'cancel_task':
-      if (data.taskId) {
+      if (data.taskId && typeof data.taskId === 'string') {
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           deleteTask(data.taskId);
@@ -534,6 +633,156 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'kb_add': {
+      if (!data.groupFolder || !data.title || !data.content) {
+        logger.warn({ data }, 'Invalid kb_add request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_add attempt blocked');
+        break;
+      }
+      const id = addKBEntry(data.groupFolder, data.title, data.content, data.tags as string | undefined);
+      const responsePath = path.join(ipcBaseDir, 'responses', `kb_add_${data.timestamp}-${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ id }));
+      logger.info({ sourceGroup, id }, 'KB entry created via IPC');
+      break;
+    }
+
+    case 'kb_search': {
+      if (!data.groupFolder || !data.query) {
+        logger.warn({ data }, 'Invalid kb_search request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_search attempt blocked');
+        break;
+      }
+      const results = searchKBEntries(data.groupFolder, data.query).map((e) => ({
+        id: e.id,
+        title: e.title,
+        snippet: e.content.substring(0, 150) + (e.content.length > 150 ? '...' : ''),
+      }));
+      const responsePath = path.join(ipcBaseDir, 'responses', `kb_search_${data.query.replace(/\s+/g, '_')}-${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ results }));
+      logger.info({ sourceGroup, query: data.query, count: results.length }, 'KB search via IPC');
+      break;
+    }
+
+    case 'kb_list': {
+      if (!data.groupFolder) {
+        logger.warn({ data }, 'Invalid kb_list request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_list attempt blocked');
+        break;
+      }
+      const entries = getKBEntriesByGroup(data.groupFolder).map((e) => ({
+        id: e.id,
+        title: e.title,
+        tags: e.tags || undefined,
+      }));
+      const responsePath = path.join(ipcBaseDir, 'responses', `kb_list_${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ entries }));
+      logger.info({ sourceGroup, count: entries.length }, 'KB list via IPC');
+      break;
+    }
+
+    case 'add_task': {
+      if (!data.groupFolder || !data.title) {
+        logger.warn({ data }, 'Invalid add_task request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized add_task attempt blocked');
+        break;
+      }
+      const id = addGroupTask(
+        data.groupFolder,
+        data.title,
+        data.description as string | undefined,
+        (data.status as string | undefined) ?? 'pending',
+        data.dueDate as string | undefined,
+        (data.taskType as string | undefined) ?? 'todo',
+        (data.priority as number | undefined) ?? 0,
+      );
+      const responsePath = path.join(ipcBaseDir, 'responses', `add_task_${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ id }));
+      logger.info({ sourceGroup, id }, 'Task created via IPC');
+      break;
+    }
+
+    case 'list_tasks': {
+      if (!data.groupFolder) {
+        logger.warn({ data }, 'Invalid list_tasks request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized list_tasks attempt blocked');
+        break;
+      }
+      let tasks: GroupTask[] = [];
+      if (data.status) {
+        tasks = getGroupTasksByStatus(data.groupFolder, data.status as string);
+      } else if (data.taskType) {
+        tasks = getGroupTasksByType(data.groupFolder, data.taskType as string);
+      } else {
+        tasks = getGroupTasksByGroup(data.groupFolder);
+      }
+      const responsePath = path.join(ipcBaseDir, 'responses', `list_tasks_${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ tasks }));
+      logger.info({ sourceGroup, count: tasks.length }, 'Task list via IPC');
+      break;
+    }
+
+    case 'update_task': {
+      if (!data.groupFolder || data.taskId === undefined || !data.updates) {
+        logger.warn({ data }, 'Invalid update_task request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized update_task attempt blocked');
+        break;
+      }
+      if (typeof data.taskId !== 'number') {
+        logger.warn({ sourceGroup, taskId: data.taskId }, 'Invalid task_id for update_task (expected number)');
+        break;
+      }
+      const success = updateGroupTask(data.taskId, data.updates);
+      const responsePath = path.join(ipcBaseDir, 'responses', `update_task_${data.taskId}-${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ success }));
+      logger.info({ sourceGroup, taskId: data.taskId, success }, 'Task updated via IPC');
+      break;
+    }
+
+    case 'delete_task': {
+      if (!data.groupFolder || data.taskId === undefined) {
+        logger.warn({ data }, 'Invalid delete_task request');
+        break;
+      }
+      if (!isMain && data.groupFolder !== sourceGroup) {
+        logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized delete_task attempt blocked');
+        break;
+      }
+      if (typeof data.taskId !== 'number') {
+        logger.warn({ sourceGroup, taskId: data.taskId }, 'Invalid task_id for delete_task (expected number)');
+        break;
+      }
+      const success = deleteGroupTask(data.taskId);
+      const responsePath = path.join(ipcBaseDir, 'responses', `delete_task_${data.taskId}-${Date.now()}.json`);
+      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
+      fs.writeFileSync(responsePath, JSON.stringify({ success }));
+      logger.info({ sourceGroup, taskId: data.taskId, success }, 'Task deleted via IPC');
+      break;
+    }
 
     case 'register_group':
       // Only main group can register new groups

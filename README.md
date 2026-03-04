@@ -11,7 +11,7 @@
 
 ## The story
 
-[NanoClaw](https://github.com/qwibitai/nanoclaw) is a brilliant little project: a personal AI assistant that lives in WhatsApp, runs in a Docker container, and uses Claude to do the thinking. The problem? Claude costs money. Real money. And the agent SDK it used was proprietary, locking you into Anthropic's ecosystem entirely.
+[The upstream project](https://github.com/qwibitai/nanoclaw) is a brilliant little project: a personal AI assistant that lives in WhatsApp, runs in a Docker container, and uses Claude to do the thinking. The problem? Claude costs money. Real money. And the agent SDK it used was proprietary, locking you into Anthropic's ecosystem entirely.
 
 **Stingyclaw** is the broke developer's fork.
 
@@ -25,7 +25,7 @@ The name? Stingyclaw is a play on being stingy. We took the claw and made it pin
 
 ## What's different from upstream
 
-|  | Upstream NanoClaw | Stingyclaw |
+|  | Upstream project | Stingyclaw |
 |---|---|---|
 | **Model** | Claude only (Anthropic subscription) | Any model: Gemini, OpenRouter, Ollama |
 | **Agent loop** | Proprietary Claude SDK | Plain `openai` package (OpenAI-compatible) |
@@ -274,7 +274,7 @@ docker compose build voice
 
 ## Original project
 
-Based on [NanoClaw](https://github.com/qwibitai/nanoclaw) by qwibitai, MIT licensed.
+Based on the [upstream project](https://github.com/qwibitai/nanoclaw) by qwibitai, MIT licensed.
 All credit for the original architecture, WhatsApp integration, IPC design, and container isolation model goes to the upstream authors.
 
 ## License

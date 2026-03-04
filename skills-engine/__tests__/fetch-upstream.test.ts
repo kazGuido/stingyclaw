@@ -14,13 +14,13 @@ describe('fetch-upstream.sh', () => {
   beforeEach(() => {
     // Create a bare repo to act as "upstream"
     upstreamBareDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'nanoclaw-upstream-'),
+      path.join(os.tmpdir(), 'stingyclaw-upstream-'),
     );
     execSync('git init --bare', { cwd: upstreamBareDir, stdio: 'pipe' });
 
     // Create a working repo, add files, push to the bare repo
     const seedDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'nanoclaw-seed-'),
+      path.join(os.tmpdir(), 'stingyclaw-seed-'),
     );
     execSync('git init', { cwd: seedDir, stdio: 'pipe' });
     execSync('git config user.email "test@test.com"', {
@@ -30,7 +30,7 @@ describe('fetch-upstream.sh', () => {
     execSync('git config user.name "Test"', { cwd: seedDir, stdio: 'pipe' });
     fs.writeFileSync(
       path.join(seedDir, 'package.json'),
-      JSON.stringify({ name: 'nanoclaw', version: '2.0.0' }),
+      JSON.stringify({ name: 'stingyclaw', version: '2.0.0' }),
     );
     fs.mkdirSync(path.join(seedDir, 'src'), { recursive: true });
     fs.writeFileSync(
@@ -65,7 +65,7 @@ describe('fetch-upstream.sh', () => {
 
     // Create the "project" repo that will run the script
     projectDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'nanoclaw-project-'),
+      path.join(os.tmpdir(), 'stingyclaw-project-'),
     );
     execSync('git init', { cwd: projectDir, stdio: 'pipe' });
     execSync('git config user.email "test@test.com"', {
@@ -78,7 +78,7 @@ describe('fetch-upstream.sh', () => {
     });
     fs.writeFileSync(
       path.join(projectDir, 'package.json'),
-      JSON.stringify({ name: 'nanoclaw', version: '1.0.0' }),
+      JSON.stringify({ name: 'stingyclaw', version: '1.0.0' }),
     );
     execSync('git add -A && git commit -m "init"', {
       cwd: projectDir,
@@ -156,7 +156,7 @@ describe('fetch-upstream.sh', () => {
     expect(status.REMOTE).toBe('upstream');
     expect(status.CURRENT_VERSION).toBe('1.0.0');
     expect(status.NEW_VERSION).toBe('2.0.0');
-    expect(status.TEMP_DIR).toMatch(/^\/tmp\/nanoclaw-update-/);
+    expect(status.TEMP_DIR).toMatch(/^\/tmp\/stingyclaw-update-/);
 
     // Verify extracted files exist
     expect(
@@ -170,10 +170,10 @@ describe('fetch-upstream.sh', () => {
     fs.rmSync(status.TEMP_DIR, { recursive: true, force: true });
   });
 
-  it('uses origin when it points to qwibitai/nanoclaw', () => {
-    // Set origin to a URL containing qwibitai/nanoclaw
+  it('uses origin when it points to qwibitai/stingyclaw', () => {
+    // Set origin to a URL containing qwibitai/stingyclaw
     execSync(
-      `git remote add origin https://github.com/qwibitai/nanoclaw.git`,
+      `git remote add origin https://github.com/qwibitai/stingyclaw.git`,
       { cwd: projectDir, stdio: 'pipe' },
     );
     // We can't actually fetch from GitHub in tests, but we can verify
@@ -218,7 +218,7 @@ describe('fetch-upstream.sh', () => {
       encoding: 'utf-8',
     });
     expect(remotes).toContain('upstream');
-    expect(remotes).toContain('qwibitai/nanoclaw');
+    expect(remotes).toContain('qwibitai/stingyclaw');
   });
 
   it('extracts files to temp dir correctly', () => {
