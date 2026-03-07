@@ -8,6 +8,47 @@ import { logger } from './logger.js';
 import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
 
 let db: Database.Database;
+type MessageCursor = {
+  timestamp: string;
+  messageId: string;
+};
+
+function parseMessageCursor(cursor: string | null | undefined): MessageCursor {
+  if (!cursor) {
+    return { timestamp: '', messageId: '' };
+  }
+
+  try {
+    const parsed = JSON.parse(cursor) as { timestamp?: string; messageId?: string };
+    return {
+      timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : cursor,
+      messageId: typeof parsed.messageId === 'string' ? parsed.messageId : '',
+    };
+  } catch {
+    return { timestamp: cursor, messageId: '' };
+  }
+}
+
+function messageCursorFilter(cursor: MessageCursor): { where: string; params: string[] } {
+  if (!cursor.timestamp) {
+    return {
+      where: 'timestamp > ?',
+      params: [''],
+    };
+  }
+
+  if (!cursor.messageId) {
+    return {
+      where: 'timestamp > ?',
+      params: [cursor.timestamp],
+    };
+  }
+
+  return {
+    where: '(timestamp > ? OR (timestamp = ? AND id > ?))',
+    params: [cursor.timestamp, cursor.timestamp, cursor.messageId],
+  };
+}
 
 export type MessagePipelineState =
   | 'received'
@@ -479,12 +520,14 @@ export function getNewMessages(
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
+  const cursor = parseMessageCursor(lastTimestamp);
+  const messageFilter = messageCursorFilter(cursor);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
+    WHERE ${messageFilter.where} AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
     ORDER BY timestamp
@@ -492,7 +535,7 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+    .all(...messageFilter.params, ...jids, `${botPrefix}:%`) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -507,19 +550,21 @@ export function getMessagesSince(
   sinceTimestamp: string,
   botPrefix: string,
 ): NewMessage[] {
+  const cursor = parseMessageCursor(sinceTimestamp);
+  const messageFilter = messageCursorFilter(cursor);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE chat_jid = ? AND timestamp > ?
+    WHERE chat_jid = ? AND ${messageFilter.where}
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
     ORDER BY timestamp
   `;
   return db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`) as NewMessage[];
 }
 
 /**

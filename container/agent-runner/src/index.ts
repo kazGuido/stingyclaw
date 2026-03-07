@@ -511,10 +511,10 @@ Tool: available_groups, refresh_groups, register_group
   - refresh_groups()            # Refresh from WhatsApp
   - register_group(jid, name, folder, trigger)  # Register a new group
 
-Tool: schedule_task, list_tasks, pause_task, resume_task, cancel_task
+Tool: schedule_task, list_scheduled_tasks, pause_task, resume_task, cancel_task
   Schedule recurring or one-time tasks (scheduled tasks run as full agents).
   - schedule_task(prompt, schedule_type: "cron"|"interval"|"once", schedule_value, context_mode: "group"|"isolated")
-  - list_tasks()
+  - list_scheduled_tasks()
   - pause_task(task_id), resume_task(task_id), cancel_task(task_id)
 
 Tool: kb_add, kb_search, kb_list
@@ -920,22 +920,24 @@ async function executeTool(
         const content = args.content as string;
         const tags = (args.tags as string | undefined) ?? '';
         const groupFolder = input.groupFolder;
-        const ipcTaskId = crypto.randomUUID();
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'kb_add',
+          requestId,
           groupFolder,
           title,
           content,
           tags,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_add_${ipcTaskId}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_add_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               return `Knowledge base entry created with ID: ${data.id}`;
             } catch {
               return 'Error creating KB entry.';
@@ -948,19 +950,22 @@ async function executeTool(
       case 'kb_search': {
         const query = args.query as string;
         const groupFolder = input.groupFolder;
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'kb_search',
+          requestId,
           groupFolder,
           query,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_search_${query.replace(/\s+/g, '_')}_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_search_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               if (!data.results || data.results.length === 0) return 'No matching KB entries found.';
               return data.results
                 .map((r: { id: number; title: string; snippet: string }) => `[${r.id}] ${r.title}\n${r.snippet}`)
@@ -975,18 +980,21 @@ async function executeTool(
 
       case 'kb_list': {
         const groupFolder = input.groupFolder;
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'kb_list',
+          requestId,
           groupFolder,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_list_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `kb_list_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               if (!data.entries || data.entries.length === 0) return 'No KB entries found.';
               return data.entries
                 .map((e: { id: number; title: string; tags?: string }) => `[${e.id}] ${e.title}${e.tags ? ' (#' + e.tags + ')' : ''}`)
@@ -1006,8 +1014,10 @@ async function executeTool(
         const type = (args.type as string | undefined) ?? 'todo';
         const priority = (args.priority as number | undefined) ?? 0;
         const groupFolder = input.groupFolder;
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'add_task',
+          requestId,
           groupFolder,
           title,
           description,
@@ -1016,13 +1026,14 @@ async function executeTool(
           priority,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `add_task_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `add_task_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               return `Task created with ID: ${data.id}`;
             } catch {
               return 'Error creating task.';
@@ -1036,20 +1047,23 @@ async function executeTool(
         const groupFolder = input.groupFolder;
         const status = (args.status as string | undefined) ?? '';
         const type = (args.type as string | undefined) ?? '';
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'list_tasks',
+          requestId,
           groupFolder,
           status,
           taskType: type,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `list_tasks_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `list_tasks_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               if (!data.tasks || data.tasks.length === 0) return 'No tasks found.';
               return data.tasks
                 .map((t: { id: number; title: string; status: string; due_date?: string; type: string }) =>
@@ -1072,20 +1086,23 @@ async function executeTool(
         if (args.due_date !== undefined) updates.due_date = args.due_date as string;
         if (args.priority !== undefined) updates.priority = args.priority as number;
         const groupFolder = input.groupFolder;
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'update_task',
+          requestId,
           groupFolder,
           taskId,
           updates,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `update_task_${taskId}_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `update_task_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               return data.success ? 'Task updated.' : 'Task not found.';
             } catch {
               return 'Error updating task.';
@@ -1098,19 +1115,22 @@ async function executeTool(
       case 'delete_task': {
         const taskId = args.task_id as number;
         const groupFolder = input.groupFolder;
+        const requestId = crypto.randomUUID();
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'delete_task',
+          requestId,
           groupFolder,
           taskId,
           timestamp: new Date().toISOString(),
         });
-        const responsePath = path.join(IPC_RESPONSES_DIR, `delete_task_${taskId}_${crypto.randomUUID()}.json`);
+        const responsePath = path.join(IPC_RESPONSES_DIR, `delete_task_${requestId}.json`);
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, IPC_POLL_MS));
           if (fs.existsSync(responsePath)) {
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               return data.success ? 'Task deleted.' : 'Task not found.';
             } catch {
               return 'Error deleting task.';
@@ -1192,6 +1212,7 @@ async function executeTool(
             try {
               const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
               fs.unlinkSync(responsePath);
+              if (data.error) return `Error: ${data.error}`;
               const msgs = data.messages || [];
               if (msgs.length === 0) return 'No messages in this chat yet.';
               return msgs
@@ -1238,7 +1259,7 @@ async function executeTool(
         return `Task scheduled (${filename})`;
       }
 
-      case 'list_tasks': {
+      case 'list_scheduled_tasks': {
         const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
         if (!fs.existsSync(tasksFile)) return 'No tasks found.';
         const all = JSON.parse(fs.readFileSync(tasksFile, 'utf-8')) as Array<{
@@ -1445,6 +1466,7 @@ async function runQuery(
   if (session.messages.length > maxMessagesForHistory) {
     log(`Trimming session history from ${session.messages.length} to ${maxMessagesForHistory} messages to prevent context bleed`);
     session.messages = session.messages.slice(-maxMessagesForHistory);
+    saveSession(session); // Persist trim so next run loads fewer messages; avoids repeated trim+fail cycles
   }
 
   // Resuming from confirmation: user replied yes/no; execute or cancel pending tool, then continue loop.
@@ -1521,12 +1543,22 @@ async function runQuery(
       } catch (err: any) {
         lastApiError = err;
         const msg = err?.message ?? '';
+        const status = err?.status ?? err?.statusCode;
         // On 400 with a long session, trim and retry (no delay)
         if (msg.includes('400') && session.messages.length > 6) {
           log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
           session.messages = session.messages.slice(-8);
           saveSession(session);
           continue; // retry same iteration of outer loop
+        }
+        // On 429 (rate limit), retry with backoff so transient limits don't exit(1)
+        if (status === 429 || msg.includes('429')) {
+          if (attempt < maxApiRetries) {
+            const delayMs = Math.min(2000 * attempt, 10000);
+            log(`API 429 rate limit (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
+            await new Promise((r) => setTimeout(r, delayMs));
+            continue;
+          }
         }
         // On 5xx (transient), retry with backoff
         if ((err?.status === 500 || err?.status === 502 || err?.status === 503) || /5\d{2}/.test(String(err?.status ?? '')) || msg.includes('500') || msg.includes('502') || msg.includes('503')) {
@@ -1687,6 +1719,9 @@ async function main(): Promise<void> {
   delete input.secrets;
 
   log(`Backend: ${backend} | Model: ${modelName} @ ${baseURL}`);
+
+  // Persist browser profile (cookies, localStorage) per group so logins survive container restarts
+  process.env.AGENT_BROWSER_PROFILE = '/workspace/group/.browser-profile';
 
   const clientOpts: ConstructorParameters<typeof OpenAI>[0] = { apiKey, baseURL };
   if (backend === 'openrouter') {

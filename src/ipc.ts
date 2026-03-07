@@ -409,6 +409,16 @@ export async function processTaskIpc(
   deps: IpcDeps,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
+  const responsesDir = path.join(ipcBaseDir, sourceGroup, 'responses');
+  fs.mkdirSync(responsesDir, { recursive: true });
+
+  const writeResponse = (filename: string, payload: unknown): void => {
+    fs.writeFileSync(path.join(responsesDir, filename), JSON.stringify(payload), 'utf-8');
+  };
+  const writeErrorResponse = (filenamePrefix: string, requestId: string | undefined, message: string): void => {
+    if (!requestId) return;
+    writeResponse(`${filenamePrefix}_${requestId}.json`, { error: message });
+  };
 
   switch (data.type) {
     case 'schedule_task':
@@ -587,17 +597,20 @@ export async function processTaskIpc(
       break;
 
     case 'read_messages':
-      if (data.requestId && data.chatJid) {
+      if (!data.requestId || !data.chatJid) {
+        logger.warn({ data }, 'Invalid read_messages request');
+        break;
+      }
+      {
         const targetJid = data.chatJid as string;
         const targetGroup = registeredGroups[targetJid];
-        const canRead =
-          isMain ||
-          (targetGroup && targetGroup.folder === sourceGroup);
+        const canRead = isMain || (targetGroup && targetGroup.folder === sourceGroup);
         if (!canRead) {
           logger.warn(
             { sourceGroup, targetJid },
             'Unauthorized read_messages attempt blocked',
           );
+          writeErrorResponse('read_messages', data.requestId, 'You do not have permission to read that chat.');
           break;
         }
         const limit = Math.min(Math.max(1, (data.limit as number) || 50), 200);
@@ -606,26 +619,15 @@ export async function processTaskIpc(
           limit,
           ASSISTANT_NAME,
         );
-        const responsesDir = path.join(
-          ipcBaseDir,
-          sourceGroup,
-          'responses',
-        );
-        fs.mkdirSync(responsesDir, { recursive: true });
-        const responsePath = path.join(
-          responsesDir,
+        writeResponse(
           `read_messages_${data.requestId}.json`,
-        );
-        fs.writeFileSync(
-          responsePath,
-          JSON.stringify({
+          {
             messages: messages.map((m: NewMessage) => ({
               sender: m.sender_name,
               content: m.content,
               timestamp: m.timestamp,
             })),
-          }),
-          'utf-8',
+          },
         );
         logger.debug(
           { sourceGroup, targetJid, count: messages.length },
@@ -635,29 +637,31 @@ export async function processTaskIpc(
       break;
 
     case 'kb_add': {
-      if (!data.groupFolder || !data.title || !data.content) {
+      if (!data.groupFolder || !data.title || !data.content || !data.requestId) {
         logger.warn({ data }, 'Invalid kb_add request');
+        writeErrorResponse('kb_add', data.requestId, 'Invalid kb_add request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_add attempt blocked');
+        writeErrorResponse('kb_add', data.requestId, 'You do not have permission to add KB entries for this group.');
         break;
       }
       const id = addKBEntry(data.groupFolder, data.title, data.content, data.tags as string | undefined);
-      const responsePath = path.join(ipcBaseDir, 'responses', `kb_add_${data.timestamp}-${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ id }));
+      writeResponse(`kb_add_${data.requestId}.json`, { id });
       logger.info({ sourceGroup, id }, 'KB entry created via IPC');
       break;
     }
 
     case 'kb_search': {
-      if (!data.groupFolder || !data.query) {
+      if (!data.groupFolder || !data.query || !data.requestId) {
         logger.warn({ data }, 'Invalid kb_search request');
+        writeErrorResponse('kb_search', data.requestId, 'Invalid kb_search request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_search attempt blocked');
+        writeErrorResponse('kb_search', data.requestId, 'You do not have permission to search KB entries for this group.');
         break;
       }
       const results = searchKBEntries(data.groupFolder, data.query).map((e) => ({
@@ -665,20 +669,20 @@ export async function processTaskIpc(
         title: e.title,
         snippet: e.content.substring(0, 150) + (e.content.length > 150 ? '...' : ''),
       }));
-      const responsePath = path.join(ipcBaseDir, 'responses', `kb_search_${data.query.replace(/\s+/g, '_')}-${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ results }));
+      writeResponse(`kb_search_${data.requestId}.json`, { results });
       logger.info({ sourceGroup, query: data.query, count: results.length }, 'KB search via IPC');
       break;
     }
 
     case 'kb_list': {
-      if (!data.groupFolder) {
+      if (!data.groupFolder || !data.requestId) {
         logger.warn({ data }, 'Invalid kb_list request');
+        writeErrorResponse('kb_list', data.requestId, 'Invalid kb_list request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized kb_list attempt blocked');
+        writeErrorResponse('kb_list', data.requestId, 'You do not have permission to list KB entries for this group.');
         break;
       }
       const entries = getKBEntriesByGroup(data.groupFolder).map((e) => ({
@@ -686,20 +690,20 @@ export async function processTaskIpc(
         title: e.title,
         tags: e.tags || undefined,
       }));
-      const responsePath = path.join(ipcBaseDir, 'responses', `kb_list_${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ entries }));
+      writeResponse(`kb_list_${data.requestId}.json`, { entries });
       logger.info({ sourceGroup, count: entries.length }, 'KB list via IPC');
       break;
     }
 
     case 'add_task': {
-      if (!data.groupFolder || !data.title) {
+      if (!data.groupFolder || !data.title || !data.requestId) {
         logger.warn({ data }, 'Invalid add_task request');
+        writeErrorResponse('add_task', data.requestId, 'Invalid add_task request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized add_task attempt blocked');
+        writeErrorResponse('add_task', data.requestId, 'You do not have permission to add tasks for this group.');
         break;
       }
       const id = addGroupTask(
@@ -711,20 +715,20 @@ export async function processTaskIpc(
         (data.taskType as string | undefined) ?? 'todo',
         (data.priority as number | undefined) ?? 0,
       );
-      const responsePath = path.join(ipcBaseDir, 'responses', `add_task_${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ id }));
+      writeResponse(`add_task_${data.requestId}.json`, { id });
       logger.info({ sourceGroup, id }, 'Task created via IPC');
       break;
     }
 
     case 'list_tasks': {
-      if (!data.groupFolder) {
+      if (!data.groupFolder || !data.requestId) {
         logger.warn({ data }, 'Invalid list_tasks request');
+        writeErrorResponse('list_tasks', data.requestId, 'Invalid list_tasks request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized list_tasks attempt blocked');
+        writeErrorResponse('list_tasks', data.requestId, 'You do not have permission to list tasks for this group.');
         break;
       }
       let tasks: GroupTask[] = [];
@@ -735,51 +739,51 @@ export async function processTaskIpc(
       } else {
         tasks = getGroupTasksByGroup(data.groupFolder);
       }
-      const responsePath = path.join(ipcBaseDir, 'responses', `list_tasks_${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ tasks }));
+      writeResponse(`list_tasks_${data.requestId}.json`, { tasks });
       logger.info({ sourceGroup, count: tasks.length }, 'Task list via IPC');
       break;
     }
 
     case 'update_task': {
-      if (!data.groupFolder || data.taskId === undefined || !data.updates) {
+      if (!data.groupFolder || data.taskId === undefined || !data.updates || !data.requestId) {
         logger.warn({ data }, 'Invalid update_task request');
+        writeErrorResponse('update_task', data.requestId, 'Invalid update_task request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized update_task attempt blocked');
+        writeErrorResponse('update_task', data.requestId, 'You do not have permission to update tasks for this group.');
         break;
       }
       if (typeof data.taskId !== 'number') {
         logger.warn({ sourceGroup, taskId: data.taskId }, 'Invalid task_id for update_task (expected number)');
+        writeErrorResponse('update_task', data.requestId, 'Invalid task_id for update_task (expected number).');
         break;
       }
       const success = updateGroupTask(data.taskId, data.updates);
-      const responsePath = path.join(ipcBaseDir, 'responses', `update_task_${data.taskId}-${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ success }));
+      writeResponse(`update_task_${data.requestId}.json`, { success });
       logger.info({ sourceGroup, taskId: data.taskId, success }, 'Task updated via IPC');
       break;
     }
 
     case 'delete_task': {
-      if (!data.groupFolder || data.taskId === undefined) {
+      if (!data.groupFolder || data.taskId === undefined || !data.requestId) {
         logger.warn({ data }, 'Invalid delete_task request');
+        writeErrorResponse('delete_task', data.requestId, 'Invalid delete_task request.');
         break;
       }
       if (!isMain && data.groupFolder !== sourceGroup) {
         logger.warn({ sourceGroup, groupFolder: data.groupFolder }, 'Unauthorized delete_task attempt blocked');
+        writeErrorResponse('delete_task', data.requestId, 'You do not have permission to delete tasks for this group.');
         break;
       }
       if (typeof data.taskId !== 'number') {
         logger.warn({ sourceGroup, taskId: data.taskId }, 'Invalid task_id for delete_task (expected number)');
+        writeErrorResponse('delete_task', data.requestId, 'Invalid task_id for delete_task (expected number).');
         break;
       }
       const success = deleteGroupTask(data.taskId);
-      const responsePath = path.join(ipcBaseDir, 'responses', `delete_task_${data.taskId}-${Date.now()}.json`);
-      fs.mkdirSync(path.dirname(responsePath), { recursive: true });
-      fs.writeFileSync(responsePath, JSON.stringify({ success }));
+      writeResponse(`delete_task_${data.requestId}.json`, { success });
       logger.info({ sourceGroup, taskId: data.taskId, success }, 'Task deleted via IPC');
       break;
     }

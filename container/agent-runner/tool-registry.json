@@ -200,7 +200,7 @@
       }
     },
     {
-      "name": "list_tasks",
+      "name": "list_scheduled_tasks",
       "description": "List all scheduled tasks.",
       "parameters": { "type": "object", "properties": {} }
     },
@@ -394,7 +394,7 @@
     "list_workflows", "search_tools", "run_workflow",
     "kb_add", "kb_search", "kb_list",
     "add_task", "list_tasks", "update_task", "delete_task",
-    "list_tasks", "reset_session",
-    "refresh_groups", "available_groups", "read_group_messages"
+    "schedule_task", "list_scheduled_tasks", "pause_task", "resume_task", "cancel_task",
+    "reset_session", "read_group_messages"
   ]
 }

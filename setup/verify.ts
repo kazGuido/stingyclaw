@@ -92,7 +92,7 @@ export async function run(_args: string[]): Promise<void> {
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    if (/^(OPENROUTER_API_KEY|ANTHROPIC_API_KEY)=/m.test(envContent)) {
+    if (/^OPENROUTER_API_KEY=/m.test(envContent)) {
       credentials = 'configured';
     }
   }

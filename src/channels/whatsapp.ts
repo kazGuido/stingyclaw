@@ -61,7 +61,11 @@ export class WhatsAppChannel implements Channel {
   private sock!: WASocket;
   private connected = false;
   private lidToPhoneMap: Record<string, string> = {};
-  private outgoingQueue: Array<{ jid: string; text: string; idempotencyKey?: string }> = [];
+  private outgoingQueue: Array<
+    | { kind: 'text'; jid: string; text: string; idempotencyKey?: string }
+    | { kind: 'voice'; jid: string; audio: Buffer; idempotencyKey?: string }
+    | { kind: 'image'; jid: string; image: Buffer; caption?: string; idempotencyKey?: string }
+  > = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
   private reconnectAttempts = 0;
@@ -290,10 +294,11 @@ export class WhatsAppChannel implements Channel {
       return;
     }
     if (!this.connected) {
-      logger.warn({ jid }, 'WA disconnected, dropping voice message');
-      if (idempotencyKey) {
-        markOutboundDeliveryFailed(idempotencyKey, 'WA disconnected');
-      }
+      this.outgoingQueue.push({ kind: 'voice', jid, audio: audioBuffer, idempotencyKey });
+      logger.info(
+        { jid, bytes: audioBuffer.length, queueSize: this.outgoingQueue.length },
+        'WA disconnected, voice queued',
+      );
       return;
     }
     try {
@@ -312,6 +317,7 @@ export class WhatsAppChannel implements Channel {
         const msg = err instanceof Error ? err.message : String(err);
         markOutboundDeliveryFailed(idempotencyKey, msg);
       }
+      this.outgoingQueue.push({ kind: 'voice', jid, audio: audioBuffer, idempotencyKey });
     }
   }
 
@@ -333,8 +339,11 @@ export class WhatsAppChannel implements Channel {
       : `${ASSISTANT_NAME}: ${text}`;
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text: prefixed, idempotencyKey });
-      logger.info({ jid, length: prefixed.length, queueSize: this.outgoingQueue.length }, 'WA disconnected, message queued');
+      this.outgoingQueue.push({ kind: 'text', jid, text: prefixed, idempotencyKey });
+      logger.info(
+        { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
+        'WA disconnected, message queued',
+      );
       return;
     }
     try {
@@ -345,7 +354,7 @@ export class WhatsAppChannel implements Channel {
       }
     } catch (err) {
       // If send fails, queue it for retry on reconnect
-      this.outgoingQueue.push({ jid, text: prefixed, idempotencyKey });
+      this.outgoingQueue.push({ kind: 'text', jid, text: prefixed, idempotencyKey });
       logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
     }
   }
@@ -362,10 +371,17 @@ export class WhatsAppChannel implements Channel {
       return;
     }
     if (!this.connected) {
-      logger.warn({ jid }, 'WA disconnected, dropping image');
-      if (idempotencyKey) {
-        markOutboundDeliveryFailed(idempotencyKey, 'WA disconnected');
-      }
+      this.outgoingQueue.push({
+        kind: 'image',
+        jid,
+        image: imageBuffer,
+        caption: caption ? `${ASSISTANT_NAME}: ${caption}` : undefined,
+        idempotencyKey,
+      });
+      logger.info(
+        { jid, bytes: imageBuffer.length, queueSize: this.outgoingQueue.length },
+        'WA disconnected, image queued',
+      );
       return;
     }
     try {
@@ -383,6 +399,13 @@ export class WhatsAppChannel implements Channel {
         const msg = err instanceof Error ? err.message : String(err);
         markOutboundDeliveryFailed(idempotencyKey, msg);
       }
+      this.outgoingQueue.push({
+        kind: 'image',
+        jid,
+        image: imageBuffer,
+        caption: caption ? `${ASSISTANT_NAME}: ${caption}` : undefined,
+        idempotencyKey,
+      });
     }
   }
 
@@ -479,13 +502,25 @@ export class WhatsAppChannel implements Channel {
       logger.info({ count: this.outgoingQueue.length }, 'Flushing outgoing message queue');
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue[0]!;
-        // Send directly — queued items are already prefixed by sendMessage
         try {
-          await this.sock.sendMessage(item.jid, { text: item.text });
+          if (item.kind === 'text') {
+            await this.sock.sendMessage(item.jid, { text: item.text });
+          } else if (item.kind === 'voice') {
+            await this.sock.sendMessage(item.jid, {
+              audio: item.audio,
+              ptt: true,
+              mimetype: 'audio/ogg; codecs=opus',
+            });
+          } else {
+            await this.sock.sendMessage(item.jid, {
+              image: item.image,
+              caption: item.caption,
+            });
+          }
           if (item.idempotencyKey) {
             markOutboundDeliverySent(item.idempotencyKey);
           }
-          logger.info({ jid: item.jid, length: item.text.length }, 'Queued message sent');
+          logger.info({ jid: item.jid, kind: item.kind }, 'Queued message sent');
           this.outgoingQueue.shift();
         } catch (err) {
           logger.warn({ jid: item.jid, err }, 'Queued message send failed, will retry later');

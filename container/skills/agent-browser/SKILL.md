@@ -118,6 +118,15 @@ agent-browser state load auth.json
 agent-browser open https://app.example.com/dashboard
 ```
 
+### Sessions and cookies (persist per group)
+
+The browser profile is stored at `/workspace/group/.browser-profile` (the group folder is on the host), so **cookies and localStorage persist across container runs**. The user can stay logged in on a site:
+
+1. **Log in once via the agent**: e.g. "log me into example.com" → agent opens the site, user sends credentials in chat, agent fills and submits. The session is saved in the profile; next time the agent opens that site for this group, the user is still logged in.
+2. **State save/load** (for explicit snapshots): after logging in, `agent-browser state save auth.json` saves to the group folder; later `agent-browser state load auth.json` restores it. Use when you want a named snapshot (e.g. per-site).
+
+Transferring a session from the user’s own browser (e.g. export cookies and import into the agent) is not implemented yet; the user would need to log in once through the agent, or a future tool could accept an exported cookie file.
+
 ### Cookies & Storage
 
 ```bash

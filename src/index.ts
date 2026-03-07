@@ -6,6 +6,7 @@ import {
   ASSISTANT_NAME,
   buildTriggerPattern,
   DATA_DIR,
+  DASHBOARD_PORT,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
@@ -53,6 +54,40 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+type MessageCursor = {
+  timestamp: string;
+  messageId: string;
+};
+
+function parseMessageCursor(cursor: string | null | undefined): MessageCursor {
+  if (!cursor) {
+    return { timestamp: '', messageId: '' };
+  }
+
+  try {
+    const parsed = JSON.parse(cursor) as { timestamp?: string; messageId?: string };
+    return {
+      timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : cursor,
+      messageId: typeof parsed.messageId === 'string' ? parsed.messageId : '',
+    };
+  } catch {
+    return { timestamp: cursor, messageId: '' };
+  }
+}
+
+type MessageLikeForCursor = Pick<NewMessage, 'timestamp'> & { id?: string };
+
+function makeCursorFromMessages(messages: MessageLikeForCursor[]): string {
+  const lastMessage = messages[messages.length - 1];
+  if (!lastMessage) {
+    return '';
+  }
+  return JSON.stringify({
+    timestamp: lastMessage.timestamp,
+    messageId: lastMessage.id ?? '',
+  } satisfies MessageCursor);
+}
 
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
@@ -137,7 +172,9 @@ function handleHardResetCodewords(
   if (hasConfirm && pendingJid === chatJid) {
     resetStateForGroup(group.folder);
     setRouterState(PENDING_HARD_RESET_JID_KEY, '');
-    lastAgentTimestamp[chatJid] = lastTs;
+    const cursor = makeCursorFromMessages(messages);
+    if (cursor) lastAgentTimestamp[chatJid] = cursor;
+    else lastAgentTimestamp[chatJid] = JSON.stringify({ timestamp: lastTs, messageId: '' });
     saveState();
     channel.sendMessage(
       chatJid,
@@ -148,7 +185,9 @@ function handleHardResetCodewords(
   }
   if (hasTrigger) {
     setRouterState(PENDING_HARD_RESET_JID_KEY, chatJid);
-    lastAgentTimestamp[chatJid] = lastTs;
+    const cursor = makeCursorFromMessages(messages);
+    if (cursor) lastAgentTimestamp[chatJid] = cursor;
+    else lastAgentTimestamp[chatJid] = JSON.stringify({ timestamp: lastTs, messageId: '' });
     saveState();
     channel.sendMessage(
       chatJid,
@@ -224,7 +263,7 @@ function handleNewMessagesForGroup(chatJid: string): void {
 
   if (queue.sendMessage(chatJid, formatted)) {
     logger.debug({ chatJid, count: allPending.length }, 'Piped messages to active container');
-    lastAgentTimestamp[chatJid] = allPending[allPending.length - 1].timestamp;
+    lastAgentTimestamp[chatJid] = makeCursorFromMessages(allPending);
     saveState();
     channel.setTyping?.(chatJid, true)?.catch((err) =>
       logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
@@ -304,8 +343,7 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  lastAgentTimestamp[chatJid] = makeCursorFromMessages(missedMessages);
   saveState();
 
   logger.info(
@@ -326,6 +364,8 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
 
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
+  let streamedError: string | undefined;
+  let streamedNoRetry = false;
   let outputSentToUser = false;
   let ipcSentToCurrentChat = false;
   let pipelineSentMarked = false;
@@ -427,6 +467,18 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
 
     if (result.status === 'error') {
       hadError = true;
+      streamedError = result.error;
+      logger.warn({ group: group.name, error: result.error }, 'Streamed agent error');
+      // Provider unavailability / rate-limit errors are not worth retrying —
+      // the window won't have reset. Mark noRetry so we send one clear message
+      // instead of burning through all 6 retry slots and looping.
+      if (
+        result.error?.includes('429') ||
+        result.error?.toLowerCase().includes('rate limit') ||
+        result.error?.startsWith('PROVIDER_UNAVAILABLE:')
+      ) {
+        streamedNoRetry = true;
+      }
     }
   });
 
@@ -447,12 +499,13 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       );
       return { ok: true };
     }
-    const noRetry = output.noRetry === true;
+    const effectiveError = streamedError || output.error;
+    const noRetry = output.noRetry === true || streamedNoRetry;
     if (!noRetry) {
       lastAgentTimestamp[chatJid] = previousCursor;
       saveState();
       logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-      setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'queued', runId, output.error);
+      setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'queued', runId, effectiveError);
     } else {
       saveState();
       setMessagePipelineStateBulk(
@@ -460,10 +513,17 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
         pipelineMessageIds,
         'committed',
         runId,
-        output.error,
+        effectiveError,
       );
     }
-    return { ok: false, error: output.error, noRetry };
+    // Use PROVIDER_UNAVAILABLE prefix so group-queue strips it into a clean
+    // user-facing message. Pass through if already prefixed by the agent runner.
+    const userError = streamedNoRetry
+      ? (effectiveError?.startsWith('PROVIDER_UNAVAILABLE:')
+          ? effectiveError
+          : `PROVIDER_UNAVAILABLE: The AI provider is temporarily rate-limited. Please wait a minute and try again.`)
+      : effectiveError;
+    return { ok: false, error: userError, noRetry };
   }
 
   setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'committed', runId);
@@ -567,7 +627,7 @@ async function startMessageLoop(): Promise<void> {
 
       if (messages.length > 0) {
         logger.info({ count: messages.length }, 'Safety poll: new messages');
-        lastTimestamp = newTimestamp;
+        lastTimestamp = makeCursorFromMessages(messages) || newTimestamp;
         saveState();
         const seenGroups = new Set<string>();
         for (const msg of messages) {
@@ -634,8 +694,8 @@ function acquireProcessLock(): boolean {
     process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ } });
     return true;
   } catch (err) {
-    logger.warn({ err }, 'Could not acquire process lock, continuing anyway');
-    return true;
+    logger.error({ err }, 'Could not acquire process lock');
+    return false;
   }
 }
 
@@ -740,6 +800,16 @@ async function main(): Promise<void> {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
   });
+
+  // Start dashboard server if DASHBOARD_PORT is set
+  if (DASHBOARD_PORT) {
+    try {
+      const { startDashboardServer } = await import('./dashboard-server.js');
+      startDashboardServer(DASHBOARD_PORT);
+    } catch (e) {
+      logger.error({ err: e }, 'Failed to start dashboard server');
+    }
+  }
 }
 
 // Guard: only run when executed directly, not when imported by tests

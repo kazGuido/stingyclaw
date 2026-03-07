@@ -54,6 +54,12 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
 
+// Dashboard server (optional)
+export const DASHBOARD_PORT = parseInt(
+  process.env.DASHBOARD_PORT || '3000',
+  10,
+);
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

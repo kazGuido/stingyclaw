@@ -2,7 +2,7 @@
  * Container Runner for Stingyclaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn, spawnSync } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -52,6 +52,73 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function directoryLatestMtime(dir: string): number {
+  if (!fs.existsSync(dir)) {
+    return 0;
+  }
+
+  let latest = fs.statSync(dir).mtimeMs;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      latest = Math.max(latest, directoryLatestMtime(entryPath));
+    } else if (entry.isFile()) {
+      latest = Math.max(latest, fs.statSync(entryPath).mtimeMs);
+    }
+  }
+  return latest;
+}
+
+function synchronizeDirectoryIfNeeded(srcDir: string, dstDir: string): void {
+  if (!fs.existsSync(srcDir)) {
+    return;
+  }
+
+  const manifestPath = path.join(dstDir, '.sync-manifest.json');
+  const srcLatest = directoryLatestMtime(srcDir);
+  let shouldSync = true;
+
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+        sourcePath: string;
+        sourceLatestMtimeMs: number;
+      };
+      if (
+        manifest.sourcePath === srcDir &&
+        manifest.sourceLatestMtimeMs >= srcLatest &&
+        fs.existsSync(dstDir)
+      ) {
+        shouldSync = false;
+      }
+    } catch {
+      shouldSync = true;
+    }
+  }
+
+  if (!shouldSync) {
+    return;
+  }
+
+  if (fs.existsSync(dstDir)) {
+    fs.rmSync(dstDir, { recursive: true, force: true });
+  }
+  fs.cpSync(srcDir, dstDir, { recursive: true });
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify(
+      {
+        sourcePath: srcDir,
+        sourceLatestMtimeMs: srcLatest,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function buildVolumeMounts(
@@ -117,7 +184,7 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      synchronizeDirectoryIfNeeded(srcDir, dstDir);
     }
   }
   mounts.push({
@@ -147,7 +214,7 @@ function buildVolumeMounts(
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
   if (fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    synchronizeDirectoryIfNeeded(agentRunnerSrc, groupAgentRunnerDir);
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -246,29 +313,6 @@ export async function runContainerAgent(
 
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
-
-  // Pre-run TypeScript check on canonical agent-runner source (same code we sync into the group and compile in-container).
-  // Fails fast with a clear error instead of container exit code 2 and empty stderr.
-  const agentRunnerDir = path.join(process.cwd(), 'container', 'agent-runner');
-  if (fs.existsSync(path.join(agentRunnerDir, 'tsconfig.json'))) {
-    const tsc = spawnSync('npx', ['tsc', '--noEmit'], {
-      cwd: agentRunnerDir,
-      encoding: 'utf-8',
-      timeout: 30_000,
-    });
-    if (tsc.status !== 0) {
-      const out = (tsc.stderr || tsc.stdout || '').trim().slice(-800);
-      logger.error(
-        { group: group.name, exitCode: tsc.status },
-        'Agent source TypeScript check failed (container would exit 2)',
-      );
-      return Promise.resolve({
-        status: 'error',
-        result: null,
-        error: `Agent source has TypeScript errors. Fix container/agent-runner/src and try again.\n${out}`,
-      });
-    }
-  }
 
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
