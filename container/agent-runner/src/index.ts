@@ -17,8 +17,10 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { pipeline, env as xenovaEnv } from '@xenova/transformers';
-import { createOpenRouter } from '@openrouter/ai-sdk-provider';
-import { generateText, jsonSchema } from 'ai';
+import { jsonSchema } from 'ai';
+
+// Import our custom OpenRouter client (replaces Vercel SDK)
+import { callOpenRouter, convertTools, buildMessages, OpenRouterMessage, OpenRouterTool } from './openrouter-client.js';
 
 // Store model in the shared stingyclaw data dir so it persists across rebuilds
 xenovaEnv.cacheDir = '/home/node/.stingyclaw/transformers';
@@ -1359,7 +1361,6 @@ async function runQuery(
   prompt: string,
   session: Session,
   input: ContainerInput,
-  openrouter: ReturnType<typeof createOpenRouter>,
   modelName: string,
 ): Promise<{
   result: string | null;
@@ -1442,45 +1443,64 @@ async function runQuery(
       }
     }
     // Strip provider-specific fields and convert to Vercel SDK format.
-    // SDK expects: assistant content string (not null); tool messages with content as array of { type: 'tool-result', toolCallId, toolName, output }.
+    // SDK expects: assistant content string (not null); tool messages as simple strings with tool_call_id.
     const sanitizedMessages = messagesForApi.map((m: any) => {
       if (m.role === 'assistant') {
         return { role: m.role, content: typeof m.content === 'string' ? m.content : '' };
       }
       if (m.role === 'tool') {
-        const toolName = toolCallIdToName[m.tool_call_id] ?? 'unknown';
+        // Vercel SDK with OpenRouter expects tool results as simple string content with tool_call_id
         return {
           role: 'tool' as const,
-          content: [{ type: 'tool-result' as const, toolCallId: m.tool_call_id, toolName, output: m.content }],
+          tool_call_id: m.tool_call_id,
+          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
         };
       }
       return m;
     });
 
-    // Use Vercel AI SDK with OpenRouter provider
+    // Use our custom OpenRouter HTTP client (replaces Vercel SDK)
     let responseText: string | undefined;
     let toolCalls: Array<{ id: string; function: { name: string; arguments: string } }> = [];
-    
+
     try {
-      const result = await generateText({
-        model: openrouter.chat(modelName),
-        messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
-        tools: toolsForContext,
-        maxTokens: 8192,
-      });
-      
-      responseText = result.text;
-      toolCalls = (result.toolCalls || []).map(tc => ({
-        id: tc.toolCallId,
+      // Convert tools to OpenRouter format
+      const openRouterTools = toolsForContext ? convertTools(toolsForContext) : undefined;
+
+      // Build messages in OpenRouter format
+      const openRouterMessages = buildMessages(systemPrompt, sanitizedMessages);
+
+      // Call OpenRouter directly
+      const apiKey = input.secrets?.OPENROUTER_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENROUTER_API_KEY not provided');
+      }
+
+      const result = await callOpenRouter(
+        apiKey,
+        modelName,
+        openRouterMessages,
+        openRouterTools,
+        8192,
+      );
+
+      const choice = result.choices?.[0];
+      if (!choice) {
+        throw new Error('No response from OpenRouter');
+      }
+
+      responseText = choice.message?.content || undefined;
+      toolCalls = (choice.message?.tool_calls || []).map(tc => ({
+        id: tc.id,
         function: {
-          name: tc.toolName,
-          arguments: JSON.stringify(tc.args),
+          name: tc.function.name,
+          arguments: tc.function.arguments,
         },
       }));
     } catch (err: any) {
       const msg = err?.message ?? '';
       const status = err?.status ?? err?.statusCode;
-      
+
       // Handle specific error types
       if (msg.includes('400') && session.messages.length > 6) {
         log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
@@ -1489,7 +1509,7 @@ async function runQuery(
         // Retry this iteration
         continue;
       }
-      
+
       // Re-throw other errors to be handled by outer error handling
       throw err;
     }
@@ -1623,16 +1643,6 @@ async function main(): Promise<void> {
   // Persist browser profile (cookies, localStorage) per group so logins survive container restarts
   process.env.AGENT_BROWSER_PROFILE = '/workspace/group/.browser-profile';
 
-  // Create OpenRouter provider for Vercel AI SDK
-  const openrouter = createOpenRouter({
-    apiKey,
-    baseURL,
-    headers: backend === 'openrouter' ? {
-      'HTTP-Referer': 'https://github.com/kazGuido/stingyclaw',
-      'X-Title': 'Stingyclaw',
-    } : {},
-  });
-
   let session: Session = (input.sessionId ? loadSession(input.sessionId) : null) ?? newSession();
 
   // Restore pending confirmation from host DB if present
@@ -1666,7 +1676,7 @@ async function main(): Promise<void> {
   try {
     while (true) {
       log(`Starting query (session: ${session.id})...`);
-      const runResult = await runQuery(prompt, session, input, openrouter, modelName);
+      const runResult = await runQuery(prompt, session, input, modelName);
 
       if (runResult.confirmationRequired) {
         writeOutput({
