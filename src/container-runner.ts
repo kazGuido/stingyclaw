@@ -7,6 +7,8 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+  CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -26,6 +28,53 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---STINGYCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---STINGYCLAW_OUTPUT_END---';
 
+/**
+ * Circuit breaker for AI provider calls.
+ * Prevents cascade failures when provider is down or rate-limiting.
+ */
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailureTime: number | null = null;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+
+  recordSuccess(): void {
+    this.failures = 0;
+    this.state = 'closed';
+  }
+
+  recordFailure(): void {
+    this.failures++;
+    this.lastFailureTime = Date.now();
+    if (this.failures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD) {
+      this.state = 'open';
+      logger.error(
+        { failures: this.failures, threshold: CIRCUIT_BREAKER_FAILURE_THRESHOLD },
+        'Circuit breaker opened - AI provider calls suspended',
+      );
+    }
+  }
+
+  canExecute(): boolean {
+    if (this.state === 'closed') return true;
+
+    // Check if enough time has passed to try again
+    if (this.lastFailureTime && Date.now() - this.lastFailureTime > CIRCUIT_BREAKER_RESET_TIMEOUT_MS) {
+      this.state = 'half-open';
+      logger.info('Circuit breaker entering half-open state - allowing test call');
+      return true;
+    }
+
+    return false;
+  }
+
+  getState(): string {
+    return this.state;
+  }
+}
+
+// Global circuit breaker instance
+const aiProviderCircuitBreaker = new CircuitBreaker();
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -35,6 +84,13 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** Pending confirmation from previous session (persisted across restarts) */
+  pendingConfirmation?: {
+    toolCallId: string;
+    toolName: string;
+    args: Record<string, unknown>;
+    preview: string;
+  };
 }
 
 export interface ContainerOutput {
@@ -42,6 +98,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Server-side only: real error reason for logs (not sent to user). */
+  errorDetail?: string;
   /** When status is confirmation_required: message to show user (ask_boss-style preview). */
   confirmationPreview?: string;
   /** When status is confirmation_required: tool name and args for logging. */
@@ -278,6 +336,16 @@ export async function runContainerAgent(
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  // Check circuit breaker before attempting to run
+  if (!aiProviderCircuitBreaker.canExecute()) {
+    return {
+      status: 'error',
+      result: null,
+      error: 'PROVIDER_UNAVAILABLE: AI provider is temporarily unavailable due to multiple failures. Please try again in a minute.',
+      errorDetail: `Circuit breaker is ${aiProviderCircuitBreaker.getState()}`,
+    };
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
@@ -464,6 +532,7 @@ export async function runContainerAgent(
             'Container timed out after output (idle cleanup)',
           );
           outputChain.then(() => {
+            aiProviderCircuitBreaker.recordSuccess();
             resolve({
               status: 'success',
               result: null,
@@ -478,6 +547,7 @@ export async function runContainerAgent(
           'Container timed out with no output',
         );
 
+        aiProviderCircuitBreaker.recordFailure();
         resolve({
           status: 'error',
           result: null,
@@ -564,6 +634,7 @@ export async function runContainerAgent(
           code === 2
             ? ' Exit code 2 usually means the agent TypeScript compile failed in the container; check the full log for details.'
             : '';
+        aiProviderCircuitBreaker.recordFailure();
         resolve({
           status: 'error',
           result: null,
@@ -579,6 +650,7 @@ export async function runContainerAgent(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
           );
+          aiProviderCircuitBreaker.recordSuccess();
           resolve({
             status: 'success',
             result: null,
@@ -617,6 +689,13 @@ export async function runContainerAgent(
           'Container completed',
         );
 
+        // Record circuit breaker success/failure based on output status
+        if (output.status === 'success') {
+          aiProviderCircuitBreaker.recordSuccess();
+        } else {
+          aiProviderCircuitBreaker.recordFailure();
+        }
+
         resolve(output);
       } catch (err) {
         logger.error(
@@ -629,6 +708,7 @@ export async function runContainerAgent(
           'Failed to parse container output',
         );
 
+        aiProviderCircuitBreaker.recordFailure();
         resolve({
           status: 'error',
           result: null,
@@ -640,6 +720,7 @@ export async function runContainerAgent(
     container.on('error', (err) => {
       clearTimeout(timeout);
       logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
+      aiProviderCircuitBreaker.recordFailure();
       resolve({
         status: 'error',
         result: null,

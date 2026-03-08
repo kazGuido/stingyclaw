@@ -147,7 +147,9 @@ export class WhatsAppChannel implements Channel {
           logger.info({ delayMs: delay, attempt: this.reconnectAttempts, reason }, 'Reconnecting with backoff...');
           try {
             this.sock?.end(undefined);
-          } catch { /* ignore */ }
+          } catch (err) {
+            logger.debug({ err }, 'Socket end failed during reconnect');
+          }
           setTimeout(() => {
             this.connectInternal().catch((err) => {
               logger.error({ err }, 'Reconnect attempt failed, will retry via next close event');

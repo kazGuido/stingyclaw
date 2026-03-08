@@ -54,6 +54,16 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
 
+// Circuit breaker for AI provider failures
+export const CIRCUIT_BREAKER_FAILURE_THRESHOLD = Math.max(
+  1,
+  parseInt(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD || '5', 10) || 5,
+); // Number of failures before opening circuit
+export const CIRCUIT_BREAKER_RESET_TIMEOUT_MS = Math.max(
+  10000,
+  parseInt(process.env.CIRCUIT_BREAKER_RESET_TIMEOUT_MS || '60000', 10) || 60000,
+); // Time before trying again after circuit opens
+
 // Dashboard server (optional)
 export const DASHBOARD_PORT = Math.max(
   parseInt(process.env.DASHBOARD_PORT || '0', 10) || 0,

@@ -178,6 +178,17 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_message_pipeline_state
       ON message_pipeline(state, updated_at);
+
+    -- Pending confirmations for tool approvals (persisted across restarts)
+    CREATE TABLE IF NOT EXISTS pending_confirmations (
+      group_folder TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      args TEXT NOT NULL,
+      preview TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -776,6 +787,53 @@ export function getAllSessions(): Record<string, string> {
     result[row.group_folder] = row.session_id;
   }
   return result;
+}
+
+// --- Pending confirmation accessors (persisted across restarts) ---
+
+export interface PendingConfirmation {
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  preview: string;
+}
+
+export function getPendingConfirmation(groupFolder: string): PendingConfirmation | undefined {
+  const row = db
+    .prepare('SELECT session_id, tool_call_id, tool_name, args, preview FROM pending_confirmations WHERE group_folder = ?')
+    .get(groupFolder) as { session_id: string; tool_call_id: string; tool_name: string; args: string; preview: string } | undefined;
+  if (!row) return undefined;
+  return {
+    sessionId: row.session_id,
+    toolCallId: row.tool_call_id,
+    toolName: row.tool_name,
+    args: JSON.parse(row.args),
+    preview: row.preview,
+  };
+}
+
+export function setPendingConfirmation(
+  groupFolder: string,
+  confirmation: PendingConfirmation,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO pending_confirmations
+     (group_folder, session_id, tool_call_id, tool_name, args, preview, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    groupFolder,
+    confirmation.sessionId,
+    confirmation.toolCallId,
+    confirmation.toolName,
+    JSON.stringify(confirmation.args),
+    confirmation.preview,
+    new Date().toISOString(),
+  );
+}
+
+export function clearPendingConfirmation(groupFolder: string): void {
+  db.prepare('DELETE FROM pending_confirmations WHERE group_folder = ?').run(groupFolder);
 }
 
 // --- Registered group accessors ---

@@ -20,6 +20,7 @@ import {
 } from './container-runner.js';
 import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
+  clearPendingConfirmation,
   clearSession as clearSessionInDb,
   getAllChats,
   getAllRegisteredGroups,
@@ -27,9 +28,11 @@ import {
   getAllTasks,
   getMessagesSince,
   getNewMessages,
+  getPendingConfirmation,
   getRouterState,
   initDatabase,
   setMessagePipelineStateBulk,
+  setPendingConfirmation,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -226,7 +229,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
  * Handle new messages for a group (event-driven path).
  * Either pipes to active container or enqueues for processing.
  */
-function handleNewMessagesForGroup(chatJid: string): void {
+async function handleNewMessagesForGroup(chatJid: string): Promise<void> {
   const group = registeredGroups[chatJid];
   if (!group) return;
 
@@ -261,10 +264,11 @@ function handleNewMessagesForGroup(chatJid: string): void {
 
   const formatted = formatMessages(allPending);
 
-  if (queue.sendMessage(chatJid, formatted)) {
+  const sent = await queue.sendMessage(chatJid, formatted);
+  if (sent) {
     logger.debug({ chatJid, count: allPending.length }, 'Piped messages to active container');
-    lastAgentTimestamp[chatJid] = makeCursorFromMessages(allPending);
-    saveState();
+    // Cursor will be advanced after container confirms successful processing
+    // The container will report back and cursor advancement happens in processGroupMessages
     channel.setTyping?.(chatJid, true)?.catch((err) =>
       logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
     );
@@ -340,11 +344,10 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     (m) => !m.is_from_me && m.content.trim().startsWith('[Voice:'),
   );
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
+  // DO NOT advance cursor before processing - this causes message loss on crash.
+  // Cursor will be advanced only after successful container completion.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] = makeCursorFromMessages(missedMessages);
-  saveState();
+  let cursorAdvanced = false;
 
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
@@ -387,6 +390,18 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
         pipelineSentMarked = true;
       }
       resetIdleTimer();
+
+      // Persist confirmation state to DB for recovery across restarts
+      if (result.pendingTool && result.newSessionId) {
+        setPendingConfirmation(group.folder, {
+          sessionId: result.newSessionId,
+          toolCallId: 'pending', // Will be set by agent
+          toolName: result.pendingTool.name,
+          args: result.pendingTool.args,
+          preview: result.confirmationPreview,
+        });
+      }
+
       // Do not notifyIdle: container is waiting for user reply
       return;
     }
@@ -468,7 +483,7 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     if (result.status === 'error') {
       hadError = true;
       streamedError = result.error;
-      logger.warn({ group: group.name, error: result.error }, 'Streamed agent error');
+      logger.warn({ group: group.name, error: result.error, errorDetail: result.errorDetail }, 'Streamed agent error');
       // Provider unavailability / rate-limit errors are not worth retrying —
       // the window won't have reset. Mark noRetry so we send one clear message
       // instead of burning through all 6 retry slots and looping.
@@ -486,10 +501,21 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output.status === 'error' || hadError) {
+    const effectiveError = streamedError || output.error;
+
+    // Report exception to owner for monitoring
+    reportExceptionToOwner(group.folder, effectiveError || 'Unknown error', 'processGroupMessages', channel);
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
+      // Still advance cursor since user saw output
+      if (!cursorAdvanced) {
+        lastAgentTimestamp[chatJid] = makeCursorFromMessages(missedMessages);
+        saveState();
+        cursorAdvanced = true;
+      }
       setMessagePipelineStateBulk(
         chatJid,
         pipelineMessageIds,
@@ -499,15 +525,19 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       );
       return { ok: true };
     }
-    const effectiveError = streamedError || output.error;
+
     const noRetry = output.noRetry === true || streamedNoRetry;
     if (!noRetry) {
-      lastAgentTimestamp[chatJid] = previousCursor;
-      saveState();
-      logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+      // Cursor was never advanced, so no rollback needed - just stay at previousCursor
+      logger.warn({ group: group.name }, 'Agent error, cursor unchanged for retry');
       setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'queued', runId, effectiveError);
     } else {
-      saveState();
+      // For noRetry errors, advance cursor to prevent infinite loop
+      if (!cursorAdvanced) {
+        lastAgentTimestamp[chatJid] = makeCursorFromMessages(missedMessages);
+        saveState();
+        cursorAdvanced = true;
+      }
       setMessagePipelineStateBulk(
         chatJid,
         pipelineMessageIds,
@@ -526,8 +556,37 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
     return { ok: false, error: userError, noRetry };
   }
 
+  // Only advance cursor after successful processing - prevents message loss on crash
+  if (!cursorAdvanced) {
+    lastAgentTimestamp[chatJid] = makeCursorFromMessages(missedMessages);
+    saveState();
+    cursorAdvanced = true;
+  }
+
   setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'committed', runId);
   return { ok: true };
+}
+
+/**
+ * Report exception to the owner (main group) for monitoring and debugging.
+ */
+async function reportExceptionToOwner(
+  sourceGroup: string,
+  error: string,
+  context: string,
+  channel: any,
+): Promise<void> {
+  const mainJid = Object.keys(registeredGroups).find(
+    (jid) => registeredGroups[jid].folder === MAIN_GROUP_FOLDER,
+  );
+  if (!mainJid || sourceGroup === mainJid) return;
+
+  const message = `🚨 **Exception Report**\n\nGroup: ${sourceGroup}\nContext: ${context}\nError: ${error.slice(0, 500)}`;
+  try {
+    await channel.sendMessage(mainJid, message, { idempotencyKey: `exception-${Date.now()}` });
+  } catch (sendErr) {
+    logger.error({ err: sendErr }, 'Failed to send exception report to owner');
+  }
 }
 
 async function runAgent(
@@ -575,6 +634,12 @@ async function runAgent(
       }
     : undefined;
 
+  // Load any pending confirmation for this group
+  const pendingConfirmation = getPendingConfirmation(group.folder);
+  if (pendingConfirmation) {
+    logger.info({ group: group.name, tool: pendingConfirmation.toolName }, 'Resuming with pending confirmation');
+  }
+
   try {
     const output = await runContainerAgent(
       group,
@@ -585,10 +650,22 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        pendingConfirmation: pendingConfirmation ? {
+          toolCallId: pendingConfirmation.toolCallId,
+          toolName: pendingConfirmation.toolName,
+          args: pendingConfirmation.args,
+          preview: pendingConfirmation.preview,
+        } : undefined,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
     );
+
+    // Clear pending confirmation on successful completion (not confirmation_required)
+    if (output.status === 'success' && pendingConfirmation) {
+      clearPendingConfirmation(group.folder);
+      logger.debug({ group: group.name }, 'Cleared pending confirmation after success');
+    }
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
@@ -597,7 +674,7 @@ async function runAgent(
 
     if (output.status === 'error') {
       logger.error(
-        { group: group.name, error: output.error },
+        { group: group.name, error: output.error, errorDetail: output.errorDetail },
         'Container agent error',
       );
       return { status: 'error', error: output.error ?? 'Agent error', noRetry: true };
@@ -633,7 +710,9 @@ async function startMessageLoop(): Promise<void> {
         for (const msg of messages) {
           if (seenGroups.has(msg.chat_jid)) continue;
           seenGroups.add(msg.chat_jid);
-          handleNewMessagesForGroup(msg.chat_jid);
+          handleNewMessagesForGroup(msg.chat_jid).catch((err) =>
+            logger.error({ chatJid: msg.chat_jid, err }, 'Error handling new messages'),
+          );
         }
       }
     } catch (err) {
@@ -691,7 +770,13 @@ function acquireProcessLock(): boolean {
       }
     }
     fs.writeFileSync(LOCK_FILE, pid);
-    process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ } });
+    process.on('exit', () => {
+      try {
+        fs.unlinkSync(LOCK_FILE);
+      } catch (err) {
+        logger.debug({ err }, 'Lock file cleanup failed on exit');
+      }
+    });
     return true;
   } catch (err) {
     logger.error({ err }, 'Could not acquire process lock');
@@ -725,7 +810,9 @@ async function main(): Promise<void> {
     onMessage: (chatJid: string, msg: NewMessage) => {
       storeMessage(msg);
       if (!registeredGroups[chatJid]) return;
-      handleNewMessagesForGroup(chatJid);
+      handleNewMessagesForGroup(chatJid).catch((err) =>
+        logger.error({ chatJid, err }, 'Error handling new message'),
+      );
     },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
