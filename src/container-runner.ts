@@ -503,8 +503,11 @@ export async function runContainerAgent(
       ];
 
       const isError = code !== 0;
+      // Include stderr when agent reported error (even if exit 0) for debugging PROVIDER_UNAVAILABLE etc.
+      const outputHasError =
+        stdout.includes('"status":"error"') || stdout.includes('"status": "error"');
 
-      if (isVerbose || isError) {
+      if (isVerbose || isError || outputHasError) {
         logLines.push(
           `=== Input ===`,
           JSON.stringify(input, null, 2),

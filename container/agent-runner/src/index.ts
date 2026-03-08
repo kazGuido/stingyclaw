@@ -16,8 +16,9 @@ import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
-import OpenAI from 'openai';
 import { pipeline, env as xenovaEnv } from '@xenova/transformers';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+import { generateText, jsonSchema } from 'ai';
 
 // Store model in the shared stingyclaw data dir so it persists across rebuilds
 xenovaEnv.cacheDir = '/home/node/.stingyclaw/transformers';
@@ -98,15 +99,23 @@ function loadToolRegistry(): ToolRegistry {
   throw new Error('tool-registry.json not found. Tried: ' + candidates.join(', '));
 }
 
-function buildOpenAITools(registry: ToolRegistry): OpenAI.ChatCompletionTool[] {
-  return registry.tools.map((t) => ({
-    type: 'function' as const,
-    function: {
-      name: t.name,
+/** Vercel AI SDK tool format: object keyed by tool name with description + parameters (jsonSchema). */
+type VercelToolSet = Record<string, { description: string; parameters: ReturnType<typeof jsonSchema> }>;
+
+function buildVercelToolSet(entries: ToolRegistryEntry[]): VercelToolSet {
+  const out: VercelToolSet = {};
+  for (const t of entries) {
+    const schema = t.parameters as { type?: string; properties?: Record<string, unknown>; required?: string[] };
+    out[t.name] = {
       description: t.description,
-      parameters: t.parameters,
-    },
-  }));
+      parameters: jsonSchema({
+        type: schema?.type ?? 'object',
+        properties: schema?.properties ?? {},
+        required: schema?.required ?? [],
+      }),
+    };
+  }
+  return out;
 }
 
 function getToolMeta(registry: ToolRegistry, name: string): ToolRegistryEntry | undefined {
@@ -129,18 +138,18 @@ function getEnabledToolNames(registry: ToolRegistry, isMain: boolean): string[] 
   return (registry.defaultEnabledNonMain ?? []).filter((n) => allNames.includes(n));
 }
 
-/** Get tools filtered by enabled list; when query is set, semantically pick top-K. */
+/** Get tools filtered by enabled list; when query is set, semantically pick top-K. Returns Vercel SDK tool set. */
 async function getToolsForContext(
   registry: ToolRegistry,
   isMain: boolean,
   query?: string,
   topK: number = 6,
-): Promise<OpenAI.ChatCompletionTool[]> {
+): Promise<VercelToolSet> {
   const enabledNames = new Set(getEnabledToolNames(registry, isMain));
   const filteredTools = registry.tools.filter((t) => enabledNames.has(t.name));
 
   if (!query?.trim()) {
-    return buildOpenAITools({ tools: filteredTools });
+    return buildVercelToolSet(filteredTools);
   }
 
   try {
@@ -171,13 +180,12 @@ async function getToolsForContext(
     }
     
     log(`[semantic search] ${selectedTools.length} tools: ${selectedTools.map((r) => `${r.name}`).join(', ')}`);
-    return buildOpenAITools({ tools: selectedTools });
+    return buildVercelToolSet(selectedTools);
   } catch (err) {
     log(`[semantic search] Fallback: ${(err as Error).message}`);
-    // Cap fallback tools to prevent context overflow
     const fallbackTools = filteredTools.slice(0, 15);
     log(`[semantic search] Using fallback with ${fallbackTools.length} tools (max 15)`);
-    return buildOpenAITools({ tools: fallbackTools });
+    return buildVercelToolSet(fallbackTools);
   }
 }
 
@@ -224,9 +232,15 @@ interface PendingConfirmation {
   args: Record<string, unknown>;
 }
 
+type ChatMessage =
+  | { role: 'system'; content: string }
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>; refusal?: null }
+  | { role: 'tool'; tool_call_id: string; content: string };
+
 interface Session {
   id: string;
-  messages: OpenAI.ChatCompletionMessageParam[];
+  messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
   /** Set when a confirmation_required tool was requested; cleared after user confirms/cancels. */
@@ -1443,7 +1457,7 @@ async function runQuery(
   prompt: string,
   session: Session,
   input: ContainerInput,
-  client: OpenAI,
+  openrouter: ReturnType<typeof createOpenRouter>,
   modelName: string,
 ): Promise<{
   result: string | null;
@@ -1512,99 +1526,72 @@ async function runQuery(
       hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
         ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
         : session.messages;
-    // Strip provider-specific fields from assistant messages before sending.
-    // Models like Qwen return reasoning/reasoning_details which are incompatible with OpenAI API format.
-    // Keep only: role, content, and tool_calls (if any). This ensures compatibility with all models.
+    // Strip provider-specific fields from messages before sending to Vercel SDK.
+    // Vercel SDK expects CoreMessage format which doesn't include tool_calls in history
     const sanitizedMessages = messagesForApi.map((m: any) => {
-      if (m.role !== 'assistant') return m;
-      const cleaned: any = { role: m.role };
-      if (typeof m.content === 'string' && m.content !== '') cleaned.content = m.content;
-      if (m.tool_calls?.length) cleaned.tool_calls = m.tool_calls;
-      // Explicitly strip reasoning and reasoning_details that some models return
-      delete cleaned.reasoning;
-      delete cleaned.reasoning_details;
-      delete cleaned.refusal;
-      return cleaned;
+      // For assistant messages: only keep role and content
+      if (m.role === 'assistant') {
+        return { 
+          role: m.role,
+          content: typeof m.content === 'string' ? m.content : null
+        };
+      }
+      // For tool messages: keep as-is (role, tool_call_id, content)
+      if (m.role === 'tool') {
+        return {
+          role: m.role,
+          tool_call_id: m.tool_call_id,
+          content: m.content
+        };
+      }
+      // For user/system messages: keep as-is
+      return m;
     });
 
-    const maxApiRetries = 3;
-    let response: Awaited<ReturnType<typeof client.chat.completions.create>> | undefined;
-    let lastApiError: Error | null = null;
-
-    for (let attempt = 1; attempt <= maxApiRetries; attempt++) {
-      try {
-        response = await client.chat.completions.create({
-          model: modelName,
-          messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
-          tools: toolsForContext,
-          tool_choice: 'auto',
-          max_tokens: 8192,
-        });
-      } catch (err: any) {
-        lastApiError = err;
-        const msg = err?.message ?? '';
-        const status = err?.status ?? err?.statusCode;
-        // On 400 with a long session, trim and retry (no delay)
-        if (msg.includes('400') && session.messages.length > 6) {
-          log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
-          session.messages = session.messages.slice(-8);
-          saveSession(session);
-          continue; // retry same iteration of outer loop
-        }
-        // On 429 (rate limit), retry with backoff so transient limits don't exit(1)
-        if (status === 429 || msg.includes('429')) {
-          if (attempt < maxApiRetries) {
-            const delayMs = Math.min(2000 * attempt, 10000);
-            log(`API 429 rate limit (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
-            await new Promise((r) => setTimeout(r, delayMs));
-            continue;
-          }
-        }
-        // On 5xx (transient), retry with backoff
-        if ((err?.status === 500 || err?.status === 502 || err?.status === 503) || /5\d{2}/.test(String(err?.status ?? '')) || msg.includes('500') || msg.includes('502') || msg.includes('503')) {
-          if (attempt < maxApiRetries) {
-            const delayMs = Math.min(2000 * attempt, 8000);
-            log(`API 5xx (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
-            await new Promise((r) => setTimeout(r, delayMs));
-            continue;
-          }
-        }
-        throw err;
+    // Use Vercel AI SDK with OpenRouter provider
+    let responseText: string | undefined;
+    let toolCalls: Array<{ id: string; function: { name: string; arguments: string } }> = [];
+    
+    try {
+      const result = await generateText({
+        model: openrouter.chat(modelName),
+        messages: [{ role: 'system', content: systemPrompt }, ...sanitizedMessages],
+        tools: toolsForContext,
+        maxTokens: 8192,
+      });
+      
+      responseText = result.text;
+      toolCalls = (result.toolCalls || []).map(tc => ({
+        id: tc.toolCallId,
+        function: {
+          name: tc.toolName,
+          arguments: JSON.stringify(tc.args),
+        },
+      }));
+    } catch (err: any) {
+      const msg = err?.message ?? '';
+      const status = err?.status ?? err?.statusCode;
+      
+      // Handle specific error types
+      if (msg.includes('400') && session.messages.length > 6) {
+        log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
+        session.messages = session.messages.slice(-8);
+        saveSession(session);
+        // Retry this iteration
+        continue;
       }
-
-      // Response body can contain error even with 200 (e.g. OpenRouter)
-      if (!response?.choices?.length) {
-        const errBody = (response as any)?.error;
-        const code = errBody?.code ?? errBody?.status;
-        const is5xx = code >= 500 && code < 600;
-        if (is5xx && attempt < maxApiRetries) {
-          const delayMs = Math.min(2000 * attempt, 8000);
-          log(`API returned no choices (${code}) (attempt ${attempt}/${maxApiRetries}), retrying in ${delayMs}ms...`);
-          await new Promise((r) => setTimeout(r, delayMs));
-          continue;
-        }
-        const errMsg = `API returned no choices: ${JSON.stringify((response as any)?.choices ?? (response as any)?.error ?? response ?? 'null').slice(0, 250)}`;
-        log(errMsg);
-        throw new Error(errMsg);
-      }
-
-      break; // success
+      
+      // Re-throw other errors to be handled by outer error handling
+      throw err;
     }
 
-    type CompletionChoice = { message?: OpenAI.ChatCompletionMessageParam; finish_reason?: string };
-    const completion = response as { choices?: CompletionChoice[] };
-    if (!completion?.choices?.length) {
-      throw lastApiError || new Error('API returned no choices after retries');
-    }
-
-    const choice = completion.choices[0];
-    const msg = choice?.message;
-    if (!msg) {
-      const errMsg = `API choice has no message: finish_reason=${choice?.finish_reason}`;
-      log(errMsg);
-      throw new Error(errMsg);
-    }
-    session.messages.push(msg as OpenAI.ChatCompletionMessageParam);
+    // Build message structure similar to OpenAI response
+    const msg: ChatMessage = {
+      role: 'assistant',
+      content: responseText || null,
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+    };
+    session.messages.push(msg);
 
     type AssistantMsg = { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
     const assistantMsg = msg as AssistantMsg;
@@ -1614,8 +1601,8 @@ async function runQuery(
 
     const hasToolCalls = assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0;
 
-    if (!hasToolCalls || choice.finish_reason === 'stop') {
-      log(`Query complete. finish_reason=${choice.finish_reason}`);
+    if (!hasToolCalls) {
+      log(`Query complete. No more tool calls.`);
       break;
     }
 
@@ -1723,14 +1710,15 @@ async function main(): Promise<void> {
   // Persist browser profile (cookies, localStorage) per group so logins survive container restarts
   process.env.AGENT_BROWSER_PROFILE = '/workspace/group/.browser-profile';
 
-  const clientOpts: ConstructorParameters<typeof OpenAI>[0] = { apiKey, baseURL };
-  if (backend === 'openrouter') {
-    clientOpts.defaultHeaders = {
+  // Create OpenRouter provider for Vercel AI SDK
+  const openrouter = createOpenRouter({
+    apiKey,
+    baseURL,
+    headers: backend === 'openrouter' ? {
       'HTTP-Referer': 'https://github.com/kazGuido/stingyclaw',
       'X-Title': 'Stingyclaw',
-    };
-  }
-  const client = new OpenAI(clientOpts);
+    } : {},
+  });
 
   let session: Session = (input.sessionId ? loadSession(input.sessionId) : null) ?? newSession();
   log(`Session: ${session.id} (${session.messages.length} prior messages)`);
@@ -1750,7 +1738,7 @@ async function main(): Promise<void> {
   try {
     while (true) {
       log(`Starting query (session: ${session.id})...`);
-      const runResult = await runQuery(prompt, session, input, client, modelName);
+      const runResult = await runQuery(prompt, session, input, openrouter, modelName);
 
       if (runResult.confirmationRequired) {
         writeOutput({
@@ -1783,13 +1771,22 @@ async function main(): Promise<void> {
     const e = err as Error;
     const msg = e.message ?? String(err);
     log(`Fatal: ${msg}`);
-    // Provider 500: do not exit(1) so host won't retry 5 times. Send one clear message.
+    // Provider 5xx/429/no choices: do not exit(1) so host won't retry. Send one clear message.
     if (/500|502|503|Internal Server Error|no choices/.test(msg)) {
       writeOutput({
         status: 'error',
         result: null,
         newSessionId: session.id,
         error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily unavailable. Please try again in a few minutes.',
+      });
+      process.exit(0);
+    }
+    if (/429|rate limit/i.test(msg)) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: session.id,
+        error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily rate-limited. Please wait a minute and try again.',
       });
       process.exit(0);
     }
