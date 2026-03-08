@@ -74,9 +74,6 @@ export async function callOpenRouter(
     messages,
     max_tokens: maxTokens,
     temperature: 0.7,
-    // OpenRouter specific headers
-    transforms: [], // No transforms - send raw
-    include_reasoning: false,
   };
 
   if (tools && tools.length > 0) {
@@ -85,6 +82,10 @@ export async function callOpenRouter(
   }
 
   log(`Calling OpenRouter: model=${model}, messages=${messages.length}, tools=${tools?.length || 0}`);
+  
+  // Debug: log the request body (truncated)
+  const debugBody = JSON.stringify(body).slice(0, 500);
+  log(`Request body (truncated): ${debugBody}...`);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -93,6 +94,7 @@ export async function callOpenRouter(
       'Authorization': `Bearer ${apiKey}`,
       'HTTP-Referer': 'https://github.com/kazGuido/stingyclaw',
       'X-Title': 'Stingyclaw',
+      'X-Transform': 'none', // Don't transform messages
     },
     body: JSON.stringify(body),
   });
