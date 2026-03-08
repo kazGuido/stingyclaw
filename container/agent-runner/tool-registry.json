@@ -100,7 +100,8 @@
           "command": { "type": "string", "description": "Agent-browser command to run via Bash: open <url>, snapshot, snapshot -i, click @e1, fill @e2 'text', get text @e1, screenshot file.png, close" }
         },
         "required": ["command"]
-      }
+      },
+      "alwaysRequired": true
     },
     {
       "name": "send_message",
@@ -136,7 +137,8 @@
           "caption": { "type": "string", "description": "Optional caption for the image" }
         },
         "required": ["path"]
-      }
+      },
+      "alwaysRequired": true
     },
     {
       "name": "ask_boss",

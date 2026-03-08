@@ -99,6 +99,40 @@ function loadToolRegistry(): ToolRegistry {
   throw new Error('tool-registry.json not found. Tried: ' + candidates.join(', '));
 }
 
+/**
+ * Poll for IPC response with exponential backoff and jitter.
+ * More resilient than fixed 20-iteration loops.
+ */
+async function pollForIpcResponse<T>(
+  responsePath: string,
+  options: { maxWaitMs?: number; initialDelayMs?: number } = {},
+): Promise<{ found: true; data: T } | { found: false; error?: string }> {
+  const { maxWaitMs = 30000, initialDelayMs = 100 } = options;
+  const startTime = Date.now();
+  let delay = initialDelayMs;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    if (fs.existsSync(responsePath)) {
+      try {
+        const content = fs.readFileSync(responsePath, 'utf-8');
+        fs.unlinkSync(responsePath);
+        const data = JSON.parse(content) as T;
+        return { found: true, data };
+      } catch (err) {
+        log(`Failed to parse IPC response at ${responsePath}: ${err}`);
+        // Don't remove - might be still being written
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+
+    // Exponential backoff with jitter (max 1s)
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 1.5 + Math.random() * 50, 1000);
+  }
+
+  return { found: false, error: `Timeout after ${maxWaitMs}ms` };
+}
+
 /** Vercel AI SDK tool format: object keyed by tool name with description + parameters (jsonSchema). */
 type VercelToolSet = Record<string, { description: string; parameters: ReturnType<typeof jsonSchema> }>;
 
@@ -148,6 +182,12 @@ async function getToolsForContext(
   const enabledNames = new Set(getEnabledToolNames(registry, isMain));
   const filteredTools = registry.tools.filter((t) => enabledNames.has(t.name));
 
+  // Owner (main) always gets all enabled tools; no semantic limiting.
+  if (isMain) {
+    log(`[main] All ${filteredTools.length} tools enabled`);
+    return buildVercelToolSet(filteredTools);
+  }
+
   if (!query?.trim()) {
     return buildVercelToolSet(filteredTools);
   }
@@ -171,9 +211,9 @@ async function getToolsForContext(
       }
     }
     
-    // Add alwaysRequired tools if not already included
+    // Add alwaysRequired tools if not already included (bypasses enabled list - these are mandatory)
     for (const tool of alwaysRequiredTools) {
-      if (!selectedNames.has(tool.name) && enabledNames.has(tool.name)) {
+      if (!selectedNames.has(tool.name)) {
         selectedTools.push(tool);
         log(`[semantic search] Added required tool: ${tool.name}`);
       }
@@ -213,6 +253,13 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** Pending confirmation from previous session (persisted across restarts) */
+  pendingConfirmation?: {
+    toolCallId: string;
+    toolName: string;
+    args: Record<string, unknown>;
+    preview: string;
+  };
 }
 
 interface ContainerOutput {
@@ -220,6 +267,8 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Server-side only: real error reason for host logs (not sent to user). */
+  errorDetail?: string;
   /** When status is confirmation_required: message to show user (e.g. ask_boss preview). */
   confirmationPreview?: string;
   /** When status is confirmation_required: tool name and args for audit/logging. */
@@ -388,7 +437,9 @@ function setCurrentPlan(steps: string[]): void {
 function clearCurrentPlan(): void {
   try {
     if (fs.existsSync(AGENT_PLAN_PATH)) fs.unlinkSync(AGENT_PLAN_PATH);
-  } catch { /* ignore */ }
+  } catch (err) {
+    log(`Failed to clear plan: ${err}`);
+  }
 }
 
 function newSession(): Session {
@@ -402,168 +453,83 @@ function newSession(): Session {
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(input: ContainerInput): string {
+/** Only document tools that are actually passed to the model. Prevents "Model tried to call unavailable tool" (e.g. Bash) when the prompt described tools not in the API request. */
+function buildSystemPrompt(input: ContainerInput, availableToolNames: string[]): string {
   const name = input.assistantName || 'Andy';
+  const has = (tool: string) => availableToolNames.includes(tool);
+  const toolList = availableToolNames.join(', ');
+
+  const toolBlocks: string[] = [];
+  if (has('send_voice')) toolBlocks.push(`Tool: send_voice
+  Description: Send spoken audio to the chat (OGG Opus voice note).
+  When to use: User asks for audio/voice, or sent a voice message (reply with voice).
+  How to use: send_voice(text: "short message under 150 words", voice?: "Ryan" | "Aiden" | "Vivian" | "Serena" | "Uncle_Fu" | "Dylan" | "Eric" | "Ono_Anna" | "Sohee" | "French")
+  WARNING: If you don't call this when user asks for audio, they get NOTHING audible.`);
+  if (has('send_image')) toolBlocks.push(`Tool: send_image
+  Description: Send an image file to the chat. After any screenshot, call send_image(path) so the user sees it.
+  How to use: send_image(path: "relative.png", caption?: "optional text")`);
+  if (has('send_message')) toolBlocks.push(`Tool: send_message
+  Description: Send immediate text updates. How to use: send_message(text: "progress or result")`);
+  if (has('ask_boss')) toolBlocks.push(`Tool: ask_boss
+  Description: Ask the user for guidance before risky actions. How to use: ask_boss(question: "...")`);
+  if (has('Bash')) toolBlocks.push(`Tool: Bash
+  Description: Run shell commands in /workspace/group (timeout: 30s default, max 120s).
+  Example: Bash(command: "ls -la", timeout: 60000). For agent-browser: Bash(command: "agent-browser open https://...") etc.`);
+  if (has('Read') || has('Glob') || has('Grep')) toolBlocks.push(`Tool: Read, Glob, Grep
+  Description: Read files, find files by pattern, search file contents. Example: Grep(pattern: "TODO", path: "/workspace/group")`);
+  if (has('WebFetch')) toolBlocks.push(`Tool: WebFetch — Fetch a URL and return text (HTML stripped).`);
+  if (has('agent-browser')) toolBlocks.push(`Tool: agent-browser — Browser automation. Use Bash(command: "agent-browser open ..."), snapshot, click, fill, screenshot. After screenshot call send_image("file.png").`);
+  if (has('submit_plan') || has('store_memory') || has('clear_plan') || has('consult_memory')) toolBlocks.push(`Tool: submit_plan, store_memory, clear_plan, consult_memory — Plan before multi-step work; store/consult memory; clear_plan when done.`);
+  if (has('list_workflows') || has('search_tools') || has('run_workflow')) toolBlocks.push(`Tool: list_workflows, search_tools, run_workflow — Pre-built automations. list_workflows(), search_tools(query), run_workflow(name, args).`);
+  if (has('available_groups') || has('refresh_groups') || has('register_group')) toolBlocks.push(`Tool: available_groups, refresh_groups, register_group — WhatsApp group management (main only).`);
+  if (has('schedule_task')) toolBlocks.push(`Tool: schedule_task, list_scheduled_tasks, pause_task, resume_task, cancel_task — Schedule recurring or one-time tasks.`);
+  if (has('kb_add') || has('kb_search') || has('kb_list')) toolBlocks.push(`Tool: kb_add, kb_search, kb_list — Knowledge base. kb_add(title, content, tags), kb_search(query), kb_list().`);
+  if (has('add_task') || has('list_tasks') || has('update_task') || has('delete_task')) toolBlocks.push(`Tool: add_task, list_tasks, update_task, delete_task — Task management. add_task(title, ...), list_tasks(status?, type?), update_task(task_id, ...), delete_task(task_id).`);
+  if (has('read_group_messages')) toolBlocks.push(`Tool: read_group_messages — Read recent group messages for context.`);
+  if (has('reset_session')) toolBlocks.push(`Tool: reset_session — Clear conversation state and start fresh.`);
+
+  const rules: string[] = [
+    'When user asks for AUDIO or sent a voice message: you MUST call send_voice(text: "..."). Do not reply with text only.',
+    'When user asks for a SCREENSHOT/IMAGE or after you create one: call send_image(path: "file.png").',
+    'Before risky/irreversible actions: call ask_boss(question: "...") and wait for approval.',
+  ];
+  if (has('submit_plan') || has('store_memory') || has('clear_plan')) {
+    rules.push('Multi-step tasks: call submit_plan(steps: [...]) first, then execute, then store_memory and clear_plan.');
+  }
+  const workflowSteps: string[] = ['Analyze what the user wants.', 'Use only the tools listed above — never call a tool that is not in the list.'];
+  if (has('submit_plan')) workflowSteps.splice(1, 0, 'If multi-step: submit_plan() then execute.');
+  if (has('send_message') || has('send_voice')) workflowSteps.push('When done: send_message/send_voice if needed.');
+  if (has('store_memory') || has('clear_plan')) workflowSteps.push('store_memory and clear_plan when done.');
+
   const parts: string[] = [
     `You are ${name}, a helpful AI assistant connected to a WhatsApp chat.
 
-=== CRITICAL TOOL USAGE RULES (READ THESE FIRST) ===
+=== CRITICAL ===
+You ONLY have access to these tools in this context. Do NOT call any other tool (calling an unavailable tool will fail).
+Available tools: ${toolList}
 
-You MUST call the right tool for the task. If you don't, the user will NOT receive what they asked for.
+`,
+    rules.map((r, i) => `${i + 1}. ${r}`).join('\n'),
+    `
 
-1. When user asks for AUDIO or a VOICE NOTE:
-   - You MUST call send_voice(text: "...") with the message content.
-   - Do NOT reply with plain text only. If you don't call send_voice, the user gets NO audio.
+=== YOUR TOOLS (use only these) ===
 
-2. When user sends a VOICE MESSAGE (text starts with "[Voice: ...]"):
-   - You MUST call send_voice(text: "...") as your response. Do not reply with text only.
-
-3. When user asks for a SCREENSHOT or IMAGE (of a page, diagram, saved file, output):
-   - You MUST call send_image(path: "file.png") to show the image in the chat.
-   - After agent-browser screenshot file.png: immediately call send_image("file.png") before any text reply.
-   - Do NOT say "saved to file.png" — that text alone does not show the image.
-
-4. When you are about to do something RISKY or IRREVERSIBLE:
-   - Call ask_boss(question: "...") to get user approval first.
-   - Do NOT proceed without approval if you are unsure.
-
-5. Always use submit_plan() before multi-step tasks:
-   - Call submit_plan(steps: ["Step 1", "Step 2", ...]) first.
-   - Execute each step in order.
-   - When done: store_memory("one-line summary") then clear_plan().
-
-=== YOUR TOOLS AND HOW TO USE THEM ===
-
-Tool: send_voice
-  Description: Send spoken audio to the chat (OGG Opus voice note).
-  When to use: 
-    • User asks for audio, voice note, or to hear something ("send me audio", "reply with voice", "say it in a voice note")
-    • User sent a voice message (your reply must also be voice)
-    • You want a natural conversational reply (short messages under 150 words)
-  How to use: send_voice(text: "short message under 150 words", voice?: "Ryan" | "Aiden" | "Vivian" | "Serena" | "Uncle_Fu" | "Dylan" | "Eric" | "Ono_Anna" | "Sohee" | "French")
-  Use voice "French" when the user wants French speech.
-  ORDER: The system sends the voice note first, then your next text. Do NOT say "I've sent you a voice note" or "I sent the audio" in that text — the user will see the audio before your message. Use short follow-ups only, e.g. "Summary above." or "Let me know if you need more."
-  WARNING: If you don't call this when user asks for audio, they get NOTHING audible.
-
-Tool: send_image  
-  Description: Send an image file to the chat so the user sees it (not just text).
-  When to use:
-    • After screenshotting anything (agent-browser screenshot, page.png, diagram.png)
-    • User asks to see an image, screenshot, or visual output
-  How to use: send_image(path: "relative.png", caption?: "optional text")
-  WARNING: If you don't call this after a screenshot, the user sees NOTHING.
-
-Tool: send_message
-  Description: Send immediate text updates (for progress, confirmation, or when still working).
-  When to use:
-    • Long-running tasks — send progress updates
-    • You need to communicate before finishing
-    • Scheduled tasks that must report results
-  How to use: send_message(text: "progress update or final result")
-
-Tool: ask_boss
-  Description: Ask the user for guidance before risky actions or when unsure.
-  When to use:
-    • Before destructive actions (delete, overwrite, modify configs)
-    • You don't have enough context to proceed safely
-    • You need user approval to continue
-  How to use: ask_boss(question: "clear question that user can answer yes/no or with guidance")
-  Result: Your message is sent; their reply comes in the next turn. Stop and wait.
-
-Tool: Bash
-  Description: Run shell commands in /workspace/group (timeout: 30s default, max 120s).
-  Use for: Quick checks, file operations, running scripts, debugging.
-  Example: Bash(command: "ls -la && cat README.md", timeout: 60000)
-  
-  Browser automation: Use Bash to run agent-browser commands:
-    - Bash(command: "agent-browser open https://example.com")
-    - Bash(command: "agent-browser snapshot")   # get page elements with refs @e1, @e2, etc.
-    - Bash(command: "agent-browser snapshot -i")  # interactive snapshot
-    - Bash(command: "agent-browser click @e1")
-    - Bash(command: "agent-browser fill @e2 'text'")
-    - Bash(command: "agent-browser get text @e1")
-    - Bash(command: "agent-browser screenshot file.png")
-    - Bash(command: "agent-browser close")
-
-Tool: Read, Glob, Grep
-  Description: Read files, find files by pattern, search file contents with rg (ripgrep).
-  Use for: Understanding codebases, finding files, searching for patterns.
-  Example: Grep(pattern: "TODO", flags: "-i", path: "/workspace/group/src")
-
-Tool: WebFetch
-  Description: Fetch a URL and return its text content (HTML stripped). Use for static pages.
-
-Tool: agent-browser
-  Description: Full browser automation for JavaScript-heavy sites, logins, and interactions. Use Bash(command: "agent-browser <cmd>") to execute commands.
-  Bash command examples:
-    - Bash(command: "agent-browser open https://example.com")
-    - Bash(command: "agent-browser snapshot")   # get page elements with refs @e1, @e2, etc.
-    - Bash(command: "agent-browser snapshot -i")  # interactive snapshot
-    - Bash(command: "agent-browser click @e1")    # click element
-    - Bash(command: "agent-browser fill @e2 'text'")
-    - Bash(command: "agent-browser get text @e1")
-    - Bash(command: "agent-browser screenshot file.png")  # save screenshot to /workspace/group/file.png
-    - Bash(command: "agent-browser close")
-  After taking a screenshot, ALWAYS call send_image("file.png") to show it to the user.
-
-Tool: submit_plan, store_memory, clear_plan, consult_memory
-  Submit an execution plan before multi-step work. Store key facts across turns. Clear the plan when done.
-  submit_plan(steps: ["Step 1", "Step 2"])
-  store_memory(content: "one-line summary or fact to remember")
-  consult_memory()  # Read current stored memory
-  clear_plan()      # Clear after execution
-
-Tool: list_workflows, search_tools, run_workflow
-  Pre-built automations the user has configured. Use these instead of building from scratch.
-  - list_workflows()     # Show all available workflows
-  - search_tools(query)  # Find workflows by intent
-  - run_workflow(name, args)  # Run a workflow
-
-Tool: available_groups, refresh_groups, register_group
-  WhatsApp group management (main group only).
-  - available_groups()          # List discovered groups
-  - refresh_groups()            # Refresh from WhatsApp
-  - register_group(jid, name, folder, trigger)  # Register a new group
-
-Tool: schedule_task, list_scheduled_tasks, pause_task, resume_task, cancel_task
-  Schedule recurring or one-time tasks (scheduled tasks run as full agents).
-  - schedule_task(prompt, schedule_type: "cron"|"interval"|"once", schedule_value, context_mode: "group"|"isolated")
-  - list_scheduled_tasks()
-  - pause_task(task_id), resume_task(task_id), cancel_task(task_id)
-
-Tool: kb_add, kb_search, kb_list
-  Knowledge base (group-scoped). Add entries, search by keyword/semantic, list all.
-  - kb_add(title, content, tags)      # Add a new KB entry (e.g., company policy, contact, project brief)
-  - kb_search(query)                  # Search KB entries by keyword/semantic
-  - kb_list()                         # List all KB entries in this group
-
-Tool: add_task, list_tasks, update_task, delete_task
-  Task management (group-scoped). Add tasks, list by status/type, mark done, delete.
-  - add_task(title, description?, due_date?, type?, priority?)  # Add a task (type: todo/meeting/follow_up/reminder)
-  - list_tasks(status?, type?)    # List tasks (filter by status or type)
-  - update_task(task_id, title?, status?, due_date?, priority?)  # Update task
-  - delete_task(task_id)          # Delete a task
-  Example: secretary tasks like "Organize meeting notes", "Follow up on quote", " remind me next Friday".
+`,
+    toolBlocks.join('\n\n'),
+    `
 
 === WORKFLOW ===
-
-1. User sends message → you analyze what they want
-2. If multi-step: call submit_plan() first with ordered steps
-3. Execute steps using tools (Bash, Read, WebFetch, agent-browser, etc.)
-4. When done (or confirming): send message if needed, store_memory summary, clear_plan
-5. Your final text response is sent automatically after tool calls complete
+`,
+    workflowSteps.map((s, i) => `${i + 1}. ${s}`).join(' '),
+    `
 
 === SYSTEM CONTEXT ===
-
-Working directory: /workspace/group — read/write files freely.
-Extra directories may be mounted at /workspace/extra/*/
-
-Voice service: Your TTS is available via send_voice. Keep voice replies under ~150 words.
-Model: You are running with ${input.isMain ? 'main group context (full tool access)' : 'group context (filtered tools)'}.
+Working directory: /workspace/group.
+Model: ${input.isMain ? 'main group (full tool access)' : 'group context (filtered tools)'}.
 Session ID: ${input.sessionId || 'new'}
-Last agent timestamp: ${input.chatJid} — ${input.groupFolder}
-
-${input.isScheduledTask ? '\n\n[SCHEDULED TASK — this is an automated agent task, not directly from user. Your output is sent via send_message if needed.]' : ''}`,
+${input.chatJid} — ${input.groupFolder}
+${input.isMain ? `\nHow to allow tools for a specific group (operator action): Create or edit groups/<group-folder>/tools-enabled.json on the host with a JSON array of allowed tool names (e.g. ["Read","Grep","send_message","ask_boss"]). If the file is missing, that group uses the registry default allowlist. Main (you) always has all tools; other groups use tools-enabled.json or the default.\n` : ''}
+${input.isScheduledTask ? '\n[SCHEDULED TASK — output via send_message if needed.]' : ''}`,
   ];
 
   // (no secondary AI CLI — the primary model handles everything directly)
@@ -581,16 +547,22 @@ ${input.isScheduledTask ? '\n\n[SCHEDULED TASK — this is an automated agent ta
   }
 
   const memoryContent = getMemoryForPrompt();
-  if (memoryContent) {
-    parts.push('\n\n---\nStored memory (context across turns; use consult_memory to read, store_memory to update, memory_search to find by meaning):\n' + memoryContent);
+  if (memoryContent && (has('consult_memory') || has('store_memory') || has('memory_search'))) {
+    const memHints = [has('consult_memory') && 'consult_memory to read', has('store_memory') && 'store_memory to update', has('memory_search') && 'memory_search to find by meaning'].filter(Boolean) as string[];
+    parts.push('\n\n---\nStored memory (context across turns; ' + memHints.join(', ') + '):\n' + memoryContent);
   }
 
   const planContent = getPlanForPrompt();
-  if (planContent) {
-    parts.push('\n\n---\nCurrent plan (execute in order, then store_memory and clear_plan):\n' + planContent);
+  if (planContent && (has('submit_plan') || has('clear_plan'))) {
+    const planHint = (has('store_memory') || has('clear_plan')) ? ' then store_memory and clear_plan' : '';
+    parts.push('\n\n---\nCurrent plan (execute in order' + planHint + '):\n' + planContent);
   }
 
   parts.push(`
+
+=== REMINDER: ONLY THESE TOOLS ===
+You may ONLY call tools from this exact list. Do not call any other tool (e.g. submit_plan, store_memory, clear_plan, Bash, Read) unless it is in the list below.
+Allowed: ${toolList}
 
 === HISTORY vs CURRENT MESSAGE ===
 The conversation history below contains previous exchanges. The LAST user message in the list is the CURRENT INSTRUCTION you need to respond to.
@@ -615,7 +587,11 @@ function writeIpcFile(dir: string, data: object): string {
 
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+    } catch (err) {
+      log(`Failed to remove close sentinel: ${err}`);
+    }
     return true;
   }
   return false;
@@ -632,10 +608,20 @@ function drainIpcInput(): string[] {
         const data = JSON.parse(fs.readFileSync(fp, 'utf-8')) as { type?: string; text?: string };
         fs.unlinkSync(fp);
         if (data.type === 'message' && data.text) messages.push(data.text);
-      } catch { try { fs.unlinkSync(fp); } catch { /* ignore */ } }
+      } catch (err) {
+        log(`Failed to process IPC file ${file}: ${err}`);
+        try {
+          fs.unlinkSync(fp);
+        } catch (unlinkErr) {
+          log(`Failed to remove corrupt IPC file ${file}: ${unlinkErr}`);
+        }
+      }
     }
     return messages;
-  } catch { return []; }
+  } catch (err) {
+    log(`Failed to drain IPC input: ${err}`);
+    return [];
+  }
 }
 
 function waitForIpcMessage(): Promise<string | null> {
@@ -945,20 +931,10 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `kb_add_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              return `Knowledge base entry created with ID: ${data.id}`;
-            } catch {
-              return 'Error creating KB entry.';
-            }
-          }
-        }
-        return 'KB entry request timed out. Try again.';
+        const result = await pollForIpcResponse<{ error?: string; id?: string }>(responsePath, { maxWaitMs: 30000 });
+        if (!result.found) return 'KB entry request timed out. Try again.';
+        if (result.data.error) return `Error: ${result.data.error}`;
+        return `Knowledge base entry created with ID: ${result.data.id}`;
       }
 
       case 'kb_search': {
@@ -973,23 +949,13 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `kb_search_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              if (!data.results || data.results.length === 0) return 'No matching KB entries found.';
-              return data.results
-                .map((r: { id: number; title: string; snippet: string }) => `[${r.id}] ${r.title}\n${r.snippet}`)
-                .join('\n\n');
-            } catch {
-              return 'Error searching KB.';
-            }
-          }
-        }
-        return 'KB search request timed out. Try again.';
+        const searchResult = await pollForIpcResponse<{ error?: string; results?: Array<{ id: number; title: string; snippet: string }> }>(responsePath, { maxWaitMs: 30000 });
+        if (!searchResult.found) return 'KB search timed out. Try again.';
+        if (searchResult.data.error) return `Error: ${searchResult.data.error}`;
+        if (!searchResult.data.results || searchResult.data.results.length === 0) return 'No matching KB entries found.';
+        return searchResult.data.results
+          .map((r) => `[${r.id}] ${r.title}\n${r.snippet}`)
+          .join('\n\n');
       }
 
       case 'kb_list': {
@@ -1002,23 +968,13 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `kb_list_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              if (!data.entries || data.entries.length === 0) return 'No KB entries found.';
-              return data.entries
-                .map((e: { id: number; title: string; tags?: string }) => `[${e.id}] ${e.title}${e.tags ? ' (#' + e.tags + ')' : ''}`)
-                .join('\n');
-            } catch {
-              return 'Error listing KB entries.';
-            }
-          }
-        }
-        return 'KB list request timed out. Try again.';
+        const listResult = await pollForIpcResponse<{ error?: string; entries?: Array<{ id: number; title: string; tags?: string }> }>(responsePath, { maxWaitMs: 30000 });
+        if (!listResult.found) return 'KB list timed out. Try again.';
+        if (listResult.data.error) return `Error: ${listResult.data.error}`;
+        if (!listResult.data.entries || listResult.data.entries.length === 0) return 'No KB entries found.';
+        return listResult.data.entries
+          .map((e) => `[${e.id}] ${e.title}${e.tags ? ' (#' + e.tags + ')' : ''}`)
+          .join('\n');
       }
 
       case 'add_task': {
@@ -1041,20 +997,10 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `add_task_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              return `Task created with ID: ${data.id}`;
-            } catch {
-              return 'Error creating task.';
-            }
-          }
-        }
-        return 'Task creation request timed out. Try again.';
+        const addResult = await pollForIpcResponse<{ error?: string; id?: string }>(responsePath, { maxWaitMs: 30000 });
+        if (!addResult.found) return 'Task creation timed out. Try again.';
+        if (addResult.data.error) return `Error: ${addResult.data.error}`;
+        return `Task created with ID: ${addResult.data.id}`;
       }
 
       case 'list_tasks': {
@@ -1071,25 +1017,13 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `list_tasks_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              if (!data.tasks || data.tasks.length === 0) return 'No tasks found.';
-              return data.tasks
-                .map((t: { id: number; title: string; status: string; due_date?: string; type: string }) =>
-                  `[${t.id}] ${t.title} (${t.status})${t.due_date ? ' due ' + t.due_date.split('T')[0] : ''}${t.type !== 'todo' ? ' [' + t.type + ']' : ''}`,
-                )
-                .join('\n');
-            } catch {
-              return 'Error listing tasks.';
-            }
-          }
-        }
-        return 'Task list request timed out. Try again.';
+        const listTaskResult = await pollForIpcResponse<{ error?: string; tasks?: Array<{ id: number; title: string; status: string; due_date?: string; type: string }> }>(responsePath, { maxWaitMs: 30000 });
+        if (!listTaskResult.found) return 'Task list timed out. Try again.';
+        if (listTaskResult.data.error) return `Error: ${listTaskResult.data.error}`;
+        if (!listTaskResult.data.tasks || listTaskResult.data.tasks.length === 0) return 'No tasks found.';
+        return listTaskResult.data.tasks
+          .map((t) => `[${t.id}] ${t.title} (${t.status})${t.due_date ? ' due ' + t.due_date.split('T')[0] : ''}${t.type !== 'todo' ? ' [' + t.type + ']' : ''}`)
+          .join('\n');
       }
 
       case 'update_task': {
@@ -1110,20 +1044,10 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `update_task_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              return data.success ? 'Task updated.' : 'Task not found.';
-            } catch {
-              return 'Error updating task.';
-            }
-          }
-        }
-        return 'Task update request timed out. Try again.';
+        const updateResult = await pollForIpcResponse<{ error?: string; success?: boolean }>(responsePath, { maxWaitMs: 30000 });
+        if (!updateResult.found) return 'Task update timed out. Try again.';
+        if (updateResult.data.error) return `Error: ${updateResult.data.error}`;
+        return updateResult.data.success ? 'Task updated.' : 'Task not found.';
       }
 
       case 'delete_task': {
@@ -1138,20 +1062,10 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `delete_task_${requestId}.json`);
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              return data.success ? 'Task deleted.' : 'Task not found.';
-            } catch {
-              return 'Error deleting task.';
-            }
-          }
-        }
-        return 'Task deletion request timed out. Try again.';
+        const deleteResult = await pollForIpcResponse<{ error?: string; success?: boolean }>(responsePath, { maxWaitMs: 30000 });
+        if (!deleteResult.found) return 'Task deletion timed out. Try again.';
+        if (deleteResult.data.error) return `Error: ${deleteResult.data.error}`;
+        return deleteResult.data.success ? 'Task deleted.' : 'Task not found.';
       }
 
       case 'ask_boss': {
@@ -1177,24 +1091,23 @@ async function executeTool(
           try {
             const prev = JSON.parse(fs.readFileSync(groupsPath, 'utf-8')) as { lastSync?: string };
             oldLastSync = prev.lastSync ?? null;
-          } catch { /* ignore */ }
+          } catch (err) {
+            log(`Failed to parse available_groups.json: ${err}`);
+          }
         }
         writeIpcFile(IPC_TASKS_DIR, {
           type: 'refresh_groups',
           groupFolder: input.groupFolder,
           timestamp: new Date().toISOString(),
         });
-        // Poll for host to process and write updated snapshot (up to ~10s)
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, 500));
-          if (!fs.existsSync(groupsPath)) continue;
-          try {
-            const data = JSON.parse(fs.readFileSync(groupsPath, 'utf-8')) as { lastSync?: string; groups?: unknown[] };
-            const newLastSync = data.lastSync ?? null;
-            if (newLastSync && newLastSync !== oldLastSync) {
-              return JSON.stringify(data, null, 2);
-            }
-          } catch { /* retry */ }
+        // Poll for host to process and write updated snapshot (up to ~30s)
+        const refreshResult = await pollForIpcResponse<{ lastSync?: string; groups?: unknown[] }>(groupsPath, { maxWaitMs: 30000, initialDelayMs: 500 });
+        if (refreshResult.found) {
+          const newLastSync = refreshResult.data.lastSync ?? null;
+          if (newLastSync && newLastSync !== oldLastSync) {
+            return JSON.stringify(refreshResult.data, null, 2);
+          }
+          return 'Refresh requested but data has not changed. Call available_groups again in a moment.';
         }
         return 'Refresh requested but host may still be syncing. Call available_groups again in a moment.';
       }
@@ -1220,25 +1133,14 @@ async function executeTool(
           timestamp: new Date().toISOString(),
         });
         const responsePath = path.join(IPC_RESPONSES_DIR, `read_messages_${requestId}.json`);
-        for (let i = 0; i < 15; i++) {
-          await new Promise((r) => setTimeout(r, IPC_POLL_MS));
-          if (fs.existsSync(responsePath)) {
-            try {
-              const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-              fs.unlinkSync(responsePath);
-              if (data.error) return `Error: ${data.error}`;
-              const msgs = data.messages || [];
-              if (msgs.length === 0) return 'No messages in this chat yet.';
-              return msgs
-                .map((m: { sender: string; content: string; timestamp: string }) =>
-                  `[${m.timestamp}] ${m.sender}: ${m.content}`,
-                )
-                .join('\n');
-            } catch {
-              return 'Error reading message history.';
-            }
-          }
-        }
+        const readResult = await pollForIpcResponse<{ error?: string; messages?: Array<{ sender: string; content: string; timestamp: string }> }>(responsePath, { maxWaitMs: 25000 });
+        if (!readResult.found) return 'Reading message history timed out. Try again.';
+        if (readResult.data.error) return `Error: ${readResult.data.error}`;
+        const msgs = readResult.data.messages || [];
+        if (msgs.length === 0) return 'No messages in this chat yet.';
+        return msgs
+          .map((m) => `[${m.timestamp}] ${m.sender}: ${m.content}`)
+          .join('\n');
         return 'Message history request timed out. Try again.';
       }
 
@@ -1465,12 +1367,16 @@ async function runQuery(
   confirmationRequired?: { preview: string; pendingTool: { name: string; args: Record<string, unknown> } };
 }> {
   const registry = loadToolRegistry();
-  const systemPrompt = buildSystemPrompt(input);
-
   await semanticToolSearch.load(registry);
   // Use prompt for semantic tool choice only when it's a real user message, not a confirmation reply
   const queryForTools = session.pendingConfirmation ? undefined : (prompt?.trim() || undefined);
   const toolsForContext = await getToolsForContext(registry, input.isMain, queryForTools, 8);
+  const toolCount = Object.keys(toolsForContext).length;
+  if (input.isMain) {
+    log(`[OWNER] All ${toolCount} tools allowed (main group has full permission)`);
+  }
+  // Only document tools we actually pass to the API; avoids "Model tried to call unavailable tool" (e.g. Bash in restricted groups)
+  const systemPrompt = buildSystemPrompt(input, Object.keys(toolsForContext));
 
   // Clean up old conversation history to prevent context bleed
   // Keep only the last 6 messages if stored memory exists, or last 10 if not
@@ -1526,25 +1432,28 @@ async function runQuery(
       hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
         ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
         : session.messages;
-    // Strip provider-specific fields from messages before sending to Vercel SDK.
-    // Vercel SDK expects CoreMessage format which doesn't include tool_calls in history
+    // Build map tool_call_id -> toolName from assistant messages so we can format tool results for the SDK.
+    const toolCallIdToName: Record<string, string> = {};
+    for (const m of messagesForApi) {
+      if (m.role === 'assistant' && Array.isArray((m as any).tool_calls)) {
+        for (const tc of (m as any).tool_calls) {
+          if (tc.id && tc.function?.name) toolCallIdToName[tc.id] = tc.function.name;
+        }
+      }
+    }
+    // Strip provider-specific fields and convert to Vercel SDK format.
+    // SDK expects: assistant content string (not null); tool messages with content as array of { type: 'tool-result', toolCallId, toolName, output }.
     const sanitizedMessages = messagesForApi.map((m: any) => {
-      // For assistant messages: only keep role and content
       if (m.role === 'assistant') {
-        return { 
-          role: m.role,
-          content: typeof m.content === 'string' ? m.content : null
-        };
+        return { role: m.role, content: typeof m.content === 'string' ? m.content : '' };
       }
-      // For tool messages: keep as-is (role, tool_call_id, content)
       if (m.role === 'tool') {
+        const toolName = toolCallIdToName[m.tool_call_id] ?? 'unknown';
         return {
-          role: m.role,
-          tool_call_id: m.tool_call_id,
-          content: m.content
+          role: 'tool' as const,
+          content: [{ type: 'tool-result' as const, toolCallId: m.tool_call_id, toolName, output: m.content }],
         };
       }
-      // For user/system messages: keep as-is
       return m;
     });
 
@@ -1676,7 +1585,11 @@ async function main(): Promise<void> {
   try {
     const raw = await readStdin();
     input = JSON.parse(raw) as ContainerInput;
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync('/tmp/input.json');
+    } catch (unlinkErr) {
+      log(`Failed to remove temp input file: ${unlinkErr}`);
+    }
     log(`Group: ${input.groupFolder}, session: ${input.sessionId ?? 'new'}`);
   } catch (err) {
     writeOutput({ status: 'error', result: null, error: `Failed to parse input: ${err}` });
@@ -1721,10 +1634,25 @@ async function main(): Promise<void> {
   });
 
   let session: Session = (input.sessionId ? loadSession(input.sessionId) : null) ?? newSession();
+
+  // Restore pending confirmation from host DB if present
+  if (input.pendingConfirmation && !session.pendingConfirmation) {
+    session.pendingConfirmation = {
+      toolCallId: input.pendingConfirmation.toolCallId,
+      name: input.pendingConfirmation.toolName,
+      args: input.pendingConfirmation.args,
+    };
+    log(`Restored pending confirmation: ${input.pendingConfirmation.toolName}`);
+  }
+
   log(`Session: ${session.id} (${session.messages.length} prior messages)`);
 
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try {
+    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+  } catch (err) {
+    log(`Failed to remove close sentinel at startup: ${err}`);
+  }
 
   let prompt = input.prompt;
   if (input.isScheduledTask) {
@@ -1768,29 +1696,51 @@ async function main(): Promise<void> {
       prompt = next;
     }
   } catch (err) {
-    const e = err as Error;
+    const e = err as Error & { cause?: Error; status?: number; statusCode?: number };
     const msg = e.message ?? String(err);
-    log(`Fatal: ${msg}`);
-    // Provider 5xx/429/no choices: do not exit(1) so host won't retry. Send one clear message.
-    if (/500|502|503|Internal Server Error|no choices/.test(msg)) {
+    const causeMsg = e.cause instanceof Error ? e.cause.message : '';
+    // Log full error to stderr so host/container logs show the real cause (e.g. 502, no choices, fetch failed)
+    console.error('[Agent Fatal]', msg);
+    if (causeMsg) console.error('[Agent Fatal Cause]', causeMsg);
+    if (e.stack) console.error(e.stack);
+    log(`Fatal: ${msg}${causeMsg ? ` (cause: ${causeMsg})` : ''}`);
+
+    // Sanitize for logs: no URLs/keys, first 200 chars
+    const detail = (msg + (causeMsg ? ` | ${causeMsg}` : '')).slice(0, 200).replace(/sk-[^\s]+/gi, 'sk-***');
+
+    // Provider 5xx/429/no choices/network: do not exit(1) so host won't retry. Send one clear message.
+    if (/500|502|503|Internal Server Error|no choices/.test(msg) || /500|502|503|Internal Server Error|no choices/.test(causeMsg)) {
       writeOutput({
         status: 'error',
         result: null,
         newSessionId: session.id,
         error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily unavailable. Please try again in a few minutes.',
+        errorDetail: detail,
       });
       process.exit(0);
     }
-    if (/429|rate limit/i.test(msg)) {
+    if (/429|rate limit/i.test(msg) || /429|rate limit/i.test(causeMsg)) {
       writeOutput({
         status: 'error',
         result: null,
         newSessionId: session.id,
         error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily rate-limited. Please wait a minute and try again.',
+        errorDetail: detail,
       });
       process.exit(0);
     }
-    writeOutput({ status: 'error', result: null, newSessionId: session.id, error: msg });
+    // Network/connection errors: treat as temporary so user gets one message instead of retries
+    if (/ECONNREFUSED|ETIMEDOUT|fetch failed|network|socket hang up/i.test(msg) || /ECONNREFUSED|ETIMEDOUT|fetch failed|network|socket hang up/i.test(causeMsg)) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: session.id,
+        error: 'PROVIDER_UNAVAILABLE: The AI provider is temporarily unavailable. Please try again in a few minutes.',
+        errorDetail: detail,
+      });
+      process.exit(0);
+    }
+    writeOutput({ status: 'error', result: null, newSessionId: session.id, error: msg, errorDetail: detail });
     process.exit(1);
   }
 }
