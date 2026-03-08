@@ -1362,6 +1362,7 @@ async function runQuery(
   session: Session,
   input: ContainerInput,
   modelName: string,
+  apiKey: string,
 ): Promise<{
   result: string | null;
   closed: boolean;
@@ -1471,8 +1472,7 @@ async function runQuery(
       const openRouterMessages = buildMessages(systemPrompt, sanitizedMessages);
 
       // Call OpenRouter directly
-      const apiKey = input.secrets?.OPENROUTER_API_KEY;
-      if (!apiKey) {
+      if (!apiKey || apiKey === 'no-key') {
         throw new Error('OPENROUTER_API_KEY not provided');
       }
 
@@ -1636,6 +1636,8 @@ async function main(): Promise<void> {
     backend = 'openrouter';
   }
 
+  // Store API key before deleting secrets from input (runQuery needs it)
+  const storedApiKey = apiKey;
   delete input.secrets;
 
   log(`Backend: ${backend} | Model: ${modelName} @ ${baseURL}`);
@@ -1676,7 +1678,7 @@ async function main(): Promise<void> {
   try {
     while (true) {
       log(`Starting query (session: ${session.id})...`);
-      const runResult = await runQuery(prompt, session, input, modelName);
+      const runResult = await runQuery(prompt, session, input, modelName, storedApiKey);
 
       if (runResult.confirmationRequired) {
         writeOutput({
