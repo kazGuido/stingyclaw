@@ -43,7 +43,12 @@ import {
 import { ensureConfigContract } from './config-contract.js';
 import { GroupQueue, MAX_RETRIES } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { flushMessagesForGroup, startIpcWatcher } from './ipc.js';
+import {
+  beginIpcImageQuotaForChat,
+  endIpcImageQuotaForChat,
+  flushMessagesForGroup,
+  startIpcWatcher,
+} from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { synthesizeSpeech } from './transcription.js';
 import { startKbDigestLoop } from './kb-digest.js';
@@ -383,7 +388,10 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   /** One auto-send (stdout completion) per run — streaming can emit duplicate OUTPUT markers. */
   let streamFinalTextSent = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  beginIpcImageQuotaForChat(chatJid);
+  let output: Awaited<ReturnType<typeof runAgent>>;
+  try {
+    output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.status === 'confirmation_required' && result.confirmationPreview) {
       await channel.sendMessage(chatJid, result.confirmationPreview, {
@@ -514,6 +522,9 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       }
     }
   });
+  } finally {
+    endIpcImageQuotaForChat(chatJid);
+  }
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
