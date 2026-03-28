@@ -380,6 +380,8 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   let outputSentToUser = false;
   let ipcSentToCurrentChat = false;
   let pipelineSentMarked = false;
+  /** One auto-send (stdout completion) per run — streaming can emit duplicate OUTPUT markers. */
+  let streamFinalTextSent = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -444,6 +446,12 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
             'Suppressing auto-send because IPC already sent output for this chat',
           );
           outputSentToUser = true;
+        } else if (streamFinalTextSent) {
+          logger.info(
+            { group: group.name, chatJid },
+            'Suppressing duplicate streamed stdout completion (already sent to chat this run)',
+          );
+          outputSentToUser = true;
         } else {
           // Enforce voice reply when user sent voice: send text as voice note instead of plain text
           if (lastUserMessageWasVoice && channel.sendVoice) {
@@ -474,6 +482,7 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
             });
             outputSentToUser = true;
           }
+          streamFinalTextSent = true;
           if (!pipelineSentMarked) {
             setMessagePipelineStateBulk(chatJid, pipelineMessageIds, 'sent', runId);
             pipelineSentMarked = true;
