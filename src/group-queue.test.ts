@@ -363,6 +363,29 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
+  it('skips enqueue when the same task id is already running', async () => {
+    let release: () => void;
+    const barrier = new Promise<void>((r) => {
+      release = r;
+    });
+    const first = vi.fn(async () => {
+      await barrier;
+    });
+    const second = vi.fn(async () => {});
+
+    queue.enqueueTask('group1@g.us', 'same-id', first);
+    await vi.advanceTimersByTimeAsync(10);
+
+    queue.enqueueTask('group1@g.us', 'same-id', second);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+
+    release!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
   it('sendMessage returns false for task containers so user messages queue up', async () => {
     let resolveTask: () => void;
 

@@ -18,6 +18,8 @@ interface GroupState {
   active: boolean;
   idleWaiting: boolean;
   isTaskContainer: boolean;
+  /** Set while a task fn is executing (matches NanoClaw) to avoid duplicate enqueue of the same task id. */
+  runningTaskId: string | null;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -66,6 +68,7 @@ export class GroupQueue {
         active: false,
         idleWaiting: false,
         isTaskContainer: false,
+        runningTaskId: null,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -131,7 +134,11 @@ export class GroupQueue {
     this.withLock(() => {
       const state = this.getGroup(groupJid);
 
-      // Prevent double-queuing of the same task
+      // Prevent double-queuing of the same task (pending or currently running)
+      if (state.runningTaskId === taskId) {
+        logger.debug({ groupJid, taskId }, 'Task already running, skipping');
+        return;
+      }
       if (state.pendingTasks.some((t) => t.id === taskId)) {
         logger.debug({ groupJid, taskId }, 'Task already queued, skipping');
         return;
@@ -286,7 +293,8 @@ export class GroupQueue {
 
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(groupJid);
-    // Note: activeCount already incremented under lock in enqueueTask
+    // Note: activeCount already incremented under lock in enqueueTask / beginDrainedRun
+    state.runningTaskId = task.id;
 
     logger.debug(
       { groupJid, taskId: task.id, activeCount: this.activeCount },
@@ -301,6 +309,7 @@ export class GroupQueue {
       await this.withLock(() => {
         state.active = false;
         state.isTaskContainer = false;
+        state.runningTaskId = null;
         state.process = null;
         state.containerName = null;
         state.groupFolder = null;

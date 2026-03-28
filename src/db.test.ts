@@ -321,6 +321,27 @@ describe('getNewMessages', () => {
     expect(messages).toHaveLength(0);
     expect(newTimestamp).toBe('');
   });
+
+  it('limits catch-up to the N newest messages (subquery + chronological)', () => {
+    storeChatMetadata('group1@g.us', '2024-01-01T00:00:00.000Z');
+    for (let i = 1; i <= 5; i++) {
+      store({
+        id: `cap${i}`,
+        chat_jid: 'group1@g.us',
+        sender: 'user@s.whatsapp.net',
+        sender_name: 'User',
+        content: `msg${i}`,
+        timestamp: `2024-01-01T00:00:0${i}.000Z`,
+      });
+    }
+    const { messages } = getNewMessages(
+      ['group1@g.us'],
+      '2024-01-01T00:00:00.000Z',
+      'Andy',
+      2,
+    );
+    expect(messages.map((m) => m.content)).toEqual(['msg4', 'msg5']);
+  });
 });
 
 // --- storeChatMetadata ---

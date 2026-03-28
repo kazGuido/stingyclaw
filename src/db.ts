@@ -534,10 +534,14 @@ export function getMessagePipelineState(
     | undefined;
 }
 
+/** Default cap per poll for catch-up (NanoClaw-style bounded queries). */
+export const DEFAULT_MESSAGE_CATCHUP_LIMIT = 200;
+
 export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
   botPrefix: string,
+  limit: number = DEFAULT_MESSAGE_CATCHUP_LIMIT,
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
@@ -546,19 +550,23 @@ export function getNewMessages(
   const messageFilter = messageCursorFilter(cursor);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
+  // Subquery: N most recent matches, then chronological order for processing.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp,
-           COALESCE(mentions_bot, 0) AS mentions_bot
-    FROM messages
-    WHERE ${messageFilter.where} AND chat_jid IN (${placeholders})
-      AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp,
+             COALESCE(mentions_bot, 0) AS mentions_bot
+      FROM messages
+      WHERE ${messageFilter.where} AND chat_jid IN (${placeholders})
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
   `;
 
   const rows = db
     .prepare(sql)
-    .all(...messageFilter.params, ...jids, `${botPrefix}:%`) as Array<
+    .all(...messageFilter.params, ...jids, `${botPrefix}:%`, limit) as Array<
     NewMessage & { mentions_bot?: number }
   >;
 
@@ -578,23 +586,27 @@ export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
   botPrefix: string,
+  limit: number = DEFAULT_MESSAGE_CATCHUP_LIMIT,
 ): NewMessage[] {
   const cursor = parseMessageCursor(sinceTimestamp);
   const messageFilter = messageCursorFilter(cursor);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp,
-           COALESCE(mentions_bot, 0) AS mentions_bot
-    FROM messages
-    WHERE chat_jid = ? AND ${messageFilter.where}
-      AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp,
+             COALESCE(mentions_bot, 0) AS mentions_bot
+      FROM messages
+      WHERE chat_jid = ? AND ${messageFilter.where}
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
   `;
   const rows = db
     .prepare(sql)
-    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`) as Array<
+    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`, limit) as Array<
     NewMessage & { mentions_bot?: number }
   >;
   return rows.map((row) => ({
