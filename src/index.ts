@@ -497,7 +497,8 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
       if (
         result.error?.includes('429') ||
         result.error?.toLowerCase().includes('rate limit') ||
-        result.error?.startsWith('PROVIDER_UNAVAILABLE:')
+        result.error?.startsWith('PROVIDER_UNAVAILABLE:') ||
+        result.error?.startsWith('CHAT_HISTORY_ERROR:')
       ) {
         streamedNoRetry = true;
       }
@@ -553,12 +554,12 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
         effectiveError,
       );
     }
-    // Use PROVIDER_UNAVAILABLE prefix so group-queue strips it into a clean
-    // user-facing message. Pass through if already prefixed by the agent runner.
+    // Use PROVIDER_UNAVAILABLE / CHAT_HISTORY_ERROR prefix so group-queue strips to a clean user message.
     const userError = streamedNoRetry
-      ? (effectiveError?.startsWith('PROVIDER_UNAVAILABLE:')
-          ? effectiveError
-          : `PROVIDER_UNAVAILABLE: The AI provider is temporarily rate-limited. Please wait a minute and try again.`)
+      ? (effectiveError?.startsWith('PROVIDER_UNAVAILABLE:') ||
+          effectiveError?.startsWith('CHAT_HISTORY_ERROR:'))
+        ? effectiveError
+        : `PROVIDER_UNAVAILABLE: The AI provider is temporarily rate-limited. Please wait a minute and try again.`
       : effectiveError;
     return { ok: false, error: userError, noRetry };
   }

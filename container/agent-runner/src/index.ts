@@ -17,11 +17,16 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { pipeline, env as xenovaEnv } from '@xenova/transformers';
-import { generateText, jsonSchema, type CoreMessage } from 'ai';
+import { generateText, jsonSchema } from 'ai';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
 // Custom OpenRouter client used for Ollama and as fallback
 import { callOpenRouter, convertTools, buildMessages, OpenRouterMessage, OpenRouterTool } from './openrouter-client.js';
+import {
+  type ChatMessage,
+  sessionToCoreMessages,
+  trimSessionMessagesForApi,
+} from './chat-messages.js';
 
 // Store model in the shared stingyclaw data dir so it persists across rebuilds
 xenovaEnv.cacheDir = '/home/node/.stingyclaw/transformers';
@@ -283,12 +288,6 @@ interface PendingConfirmation {
   name: string;
   args: Record<string, unknown>;
 }
-
-type ChatMessage =
-  | { role: 'system'; content: string }
-  | { role: 'user'; content: string }
-  | { role: 'assistant'; content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>; refusal?: null }
-  | { role: 'tool'; tool_call_id: string; content: string };
 
 interface Session {
   id: string;
@@ -1358,66 +1357,6 @@ function getIdealMessageCount(prompt: string, currentCount: number): number {
   }
 }
 
-/** Build id -> toolName from prior assistant messages. */
-function toolCallIdToName(messages: ChatMessage[]): Record<string, string> {
-  const map: Record<string, string> = {};
-  for (const m of messages) {
-    if (m.role === 'assistant' && Array.isArray((m as any).tool_calls)) {
-      for (const tc of (m as any).tool_calls) {
-        if (tc.id && tc.function?.name) map[tc.id] = tc.function.name;
-      }
-    }
-  }
-  return map;
-}
-
-/** Convert our ChatMessage[] to AI SDK CoreMessage[] for generateText. */
-function sessionToCoreMessages(messages: ChatMessage[]): CoreMessage[] {
-  const idToName = toolCallIdToName(messages);
-  const out: CoreMessage[] = [];
-  for (const m of messages) {
-    if (m.role === 'system') continue; // system passed separately
-    if (m.role === 'user') {
-      out.push({ role: 'user', content: m.content });
-      continue;
-    }
-    if (m.role === 'assistant') {
-      const msg = m as { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
-      const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : '';
-      const toolCalls = msg.tool_calls ?? [];
-      if (toolCalls.length === 0) {
-        out.push({ role: 'assistant', content: text || '' });
-      } else {
-        const parts: Array<
-          | { type: 'text'; text: string }
-          | { type: 'tool-call'; toolCallId: string; toolName: string; args: unknown }
-        > = [];
-        if (text) parts.push({ type: 'text', text });
-        for (const tc of toolCalls) {
-          let args: unknown;
-          try {
-            args = JSON.parse(tc.function.arguments);
-          } catch {
-            args = { command: tc.function.arguments };
-          }
-          parts.push({ type: 'tool-call', toolCallId: tc.id, toolName: tc.function.name, args });
-        }
-        out.push({ role: 'assistant', content: parts });
-      }
-      continue;
-    }
-    if (m.role === 'tool') {
-      const toolName = idToName[m.tool_call_id] ?? '';
-      out.push({
-        role: 'tool',
-        content: [{ type: 'tool-result', toolCallId: m.tool_call_id, toolName, result: m.content }],
-      });
-      continue;
-    }
-  }
-  return out;
-}
-
 /** Append SDK response messages to session (assistant + tool messages from result.steps). */
 function appendStepsToSession(
   session: Session,
@@ -1473,10 +1412,11 @@ async function runQueryWithSdk(
   }
 
   const hasMemory = fs.existsSync(AGENT_MEMORY_PATH);
-  const messagesForApi =
+  const maxWindow =
     hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
-      ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
-      : session.messages;
+      ? MAX_SESSION_MESSAGES_WITH_MEMORY
+      : session.messages.length;
+  const messagesForApi = trimSessionMessagesForApi(session.messages, maxWindow);
   const coreMessages = sessionToCoreMessages(messagesForApi);
 
   const sessionRef: SessionRef = { session };
@@ -1589,7 +1529,8 @@ async function runQuery(
   const maxMessagesForHistory = hasMemory ? 6 : 10;
   if (session.messages.length > maxMessagesForHistory) {
     log(`Trimming session history from ${session.messages.length} to ${maxMessagesForHistory} messages to prevent context bleed`);
-    session.messages = session.messages.slice(-maxMessagesForHistory);
+    // trimSessionMessagesForApi: also drops leading orphan `tool` rows if the cut removed their assistant
+    session.messages = trimSessionMessagesForApi(session.messages, maxMessagesForHistory);
     saveSession(session); // Persist trim so next run loads fewer messages; avoids repeated trim+fail cycles
   }
 
@@ -1649,10 +1590,11 @@ async function runQuery(
 
     // When stored memory exists, cap messages sent to API to avoid context blow-up; memory carries prior context.
     const hasMemory = fs.existsSync(AGENT_MEMORY_PATH);
-    const messagesForApi =
+    const maxWindow =
       hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
-        ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
-        : session.messages;
+        ? MAX_SESSION_MESSAGES_WITH_MEMORY
+        : session.messages.length;
+    const messagesForApi = trimSessionMessagesForApi(session.messages, maxWindow);
     // Build map tool_call_id -> toolName from assistant messages so we can format tool results for the SDK.
     const toolCallIdToName: Record<string, string> = {};
     for (const m of messagesForApi) {
@@ -2003,8 +1945,35 @@ async function main(): Promise<void> {
     // Sanitize for logs: no URLs/keys, first 200 chars
     const detail = (msg + (causeMsg ? ` | ${causeMsg}` : '')).slice(0, 200).replace(/sk-[^\s]+/gi, 'sk-***');
 
+    const combined = `${msg}\n${causeMsg}`;
+    // Upstream model rejected the message list (often orphan tool rows after history trim) — not "outage".
+    if (
+      /InvalidParameter|must be a response.*tool_calls|preceeding message.*tool_calls|preceding message.*tool_calls/i.test(
+        combined,
+      ) ||
+      (/Invalid JSON response/i.test(msg) &&
+        /"code"\s*:\s*502/.test(causeMsg) &&
+        /Upstream error|InvalidParameter/i.test(causeMsg))
+    ) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: session.id,
+        error:
+          'CHAT_HISTORY_ERROR: The conversation could not be sent to the AI (broken tool/history sequence). Try reset_session or start a new chat.',
+        errorDetail: detail,
+      });
+      process.exit(0);
+    }
+
     // Provider 5xx/429/no choices/network: do not exit(1) so host won't retry. Send one clear message.
-    if (/500|502|503|Internal Server Error|no choices/.test(msg) || /500|502|503|Internal Server Error|no choices/.test(causeMsg)) {
+    // Do not treat Alibaba's embedded `"code":502` in JSON as HTTP 502 (that was misclassified as outage).
+    const causeHasEmbeddedVendorCode502 =
+      /"code"\s*:\s*502/.test(causeMsg) && /Upstream error|InvalidParameter/i.test(causeMsg);
+    const looksLikeHttp5xxOrNoChoices =
+      /500|502|503|Internal Server Error|no choices/.test(msg) ||
+      (/500|502|503|Internal Server Error|no choices/.test(causeMsg) && !causeHasEmbeddedVendorCode502);
+    if (looksLikeHttp5xxOrNoChoices) {
       writeOutput({
         status: 'error',
         result: null,

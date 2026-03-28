@@ -257,7 +257,9 @@ export class GroupQueue {
           state.pendingMessages = false;
           const userMessage = result.error?.startsWith('PROVIDER_UNAVAILABLE:')
             ? result.error.slice('PROVIDER_UNAVAILABLE:'.length).trim()
-            : (result.error || 'Something went wrong. Please try again.');
+            : result.error?.startsWith('CHAT_HISTORY_ERROR:')
+              ? result.error.slice('CHAT_HISTORY_ERROR:'.length).trim()
+              : (result.error || 'Something went wrong. Please try again.');
           this.onMaxRetriesExceededFn?.(groupJid, userMessage);
         } else {
           state.lastError = result.error;
