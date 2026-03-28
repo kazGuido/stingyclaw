@@ -1,6 +1,16 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
+
+function resolveProjectRoot(): string {
+  // Prefer the repository root (next to package.json), regardless of where the
+  // process was started from.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidate = path.resolve(here, '..');
+  if (fs.existsSync(path.join(candidate, 'package.json'))) return candidate;
+  return process.cwd();
+}
 
 /**
  * Parse the .env file and return values for the requested keys.
@@ -9,7 +19,7 @@ import { logger } from './logger.js';
  * so they don't leak to child processes.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
-  const envFile = path.join(process.cwd(), '.env');
+  const envFile = path.join(resolveProjectRoot(), '.env');
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');

@@ -251,6 +251,7 @@ export class GroupQueue {
         if (result.ok) {
           state.retryCount = 0;
           state.lastError = undefined;
+          state.pendingMessages = false;
         } else if (result.noRetry) {
           state.retryCount = 0;
           state.lastError = undefined;
@@ -334,6 +335,15 @@ export class GroupQueue {
     }, delayMs);
   }
 
+  /** Claim a container slot when continuing work from drain (mirrors enqueue paths). */
+  private beginDrainedRun(groupJid: string, mode: 'task' | 'messages'): void {
+    const st = this.getGroup(groupJid);
+    st.active = true;
+    st.idleWaiting = false;
+    st.isTaskContainer = mode === 'task';
+    this.activeCount++;
+  }
+
   private drainGroup(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -342,6 +352,7 @@ export class GroupQueue {
     // Tasks first (they won't be re-discovered from SQLite like messages)
     if (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
+      this.beginDrainedRun(groupJid, 'task');
       this.runTask(groupJid, task).catch((err) =>
         logger.error({ groupJid, taskId: task.id, err }, 'Unhandled error in runTask (drain)'),
       );
@@ -350,6 +361,7 @@ export class GroupQueue {
 
     // Then pending messages
     if (state.pendingMessages) {
+      this.beginDrainedRun(groupJid, 'messages');
       this.runForGroup(groupJid, 'drain').catch((err) =>
         logger.error({ groupJid, err }, 'Unhandled error in runForGroup (drain)'),
       );
@@ -371,10 +383,12 @@ export class GroupQueue {
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
         const task = state.pendingTasks.shift()!;
+        this.beginDrainedRun(nextJid, 'task');
         this.runTask(nextJid, task).catch((err) =>
           logger.error({ groupJid: nextJid, taskId: task.id, err }, 'Unhandled error in runTask (waiting)'),
         );
       } else if (state.pendingMessages) {
+        this.beginDrainedRun(nextJid, 'messages');
         this.runForGroup(nextJid, 'drain').catch((err) =>
           logger.error({ groupJid: nextJid, err }, 'Unhandled error in runForGroup (waiting)'),
         );

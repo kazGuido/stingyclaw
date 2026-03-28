@@ -21,7 +21,8 @@
     "test": "vitest run",
     "test:core": "vitest run src setup",
     "test:legacy": "vitest run skills-engine",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "validate:scenarios": "tsx scripts/validate-scenarios.ts"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",

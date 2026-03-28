@@ -61,7 +61,7 @@ function buildVercelTools(registry: ToolRegistry): Record<string, { description:
 function sanitizeMessages(messages: Array<{ role: string; content?: string | null; tool_call_id?: string }>) {
   return messages.map((m: any) => {
     if (m.role === 'assistant') {
-      return { role: m.role, content: typeof m.content === 'string' ? m.content : null };
+      return { role: m.role, content: typeof m.content === 'string' ? m.content : '' };
     }
     if (m.role === 'tool') {
       return { role: m.role, tool_call_id: m.tool_call_id, content: m.content };

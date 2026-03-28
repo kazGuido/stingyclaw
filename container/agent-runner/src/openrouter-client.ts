@@ -60,14 +60,19 @@ export interface OpenRouterResponse {
   };
 }
 
+export type OpenRouterToolChoice = 'auto' | 'none';
+
 export async function callOpenRouter(
   apiKey: string,
+  baseURL: string,
   model: string,
   messages: OpenRouterMessage[],
   tools?: OpenRouterTool[],
   maxTokens = 8192,
+  toolChoice?: OpenRouterToolChoice,
 ): Promise<OpenRouterResponse> {
-  const url = 'https://openrouter.ai/api/v1/chat/completions';
+  const root = (baseURL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
+  const url = `${root}/chat/completions`;
 
   const body: Record<string, unknown> = {
     model,
@@ -78,7 +83,7 @@ export async function callOpenRouter(
 
   if (tools && tools.length > 0) {
     body.tools = tools;
-    body.tool_choice = 'auto';
+    body.tool_choice = toolChoice ?? 'auto';
   }
 
   log(`Calling OpenRouter: model=${model}, messages=${messages.length}, tools=${tools?.length || 0}`);
