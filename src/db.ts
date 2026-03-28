@@ -213,6 +213,15 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // True when WhatsApp @mentioned this account (see whatsapp.ts); used for trigger gating.
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN mentions_bot INTEGER DEFAULT 0`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(
@@ -352,7 +361,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, mentions_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -362,6 +371,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.mentions_bot ? 1 : 0,
   );
   if (!msg.is_bot_message && !msg.is_from_me) {
     setMessagePipelineState(msg.chat_jid, msg.id, 'received');
@@ -382,7 +392,7 @@ export function storeMessageDirect(msg: {
   is_bot_message?: boolean;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, mentions_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -392,6 +402,7 @@ export function storeMessageDirect(msg: {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    0,
   );
   if (!msg.is_bot_message && !msg.is_from_me) {
     setMessagePipelineState(msg.chat_jid, msg.id, 'received');
@@ -536,7 +547,8 @@ export function getNewMessages(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp,
+           COALESCE(mentions_bot, 0) AS mentions_bot
     FROM messages
     WHERE ${messageFilter.where} AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -546,14 +558,20 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(...messageFilter.params, ...jids, `${botPrefix}:%`) as NewMessage[];
+    .all(...messageFilter.params, ...jids, `${botPrefix}:%`) as Array<
+    NewMessage & { mentions_bot?: number }
+  >;
 
   let newTimestamp = lastTimestamp;
-  for (const row of rows) {
+  const messages: NewMessage[] = rows.map((row) => ({
+    ...row,
+    mentions_bot: row.mentions_bot === 1,
+  }));
+  for (const row of messages) {
     if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
   }
 
-  return { messages: rows, newTimestamp };
+  return { messages, newTimestamp };
 }
 
 export function getMessagesSince(
@@ -566,16 +584,23 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp,
+           COALESCE(mentions_bot, 0) AS mentions_bot
     FROM messages
     WHERE chat_jid = ? AND ${messageFilter.where}
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
     ORDER BY timestamp
   `;
-  return db
+  const rows = db
     .prepare(sql)
-    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`) as NewMessage[];
+    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`) as Array<
+    NewMessage & { mentions_bot?: number }
+  >;
+  return rows.map((row) => ({
+    ...row,
+    mentions_bot: row.mentions_bot === 1,
+  }));
 }
 
 /**
@@ -588,7 +613,8 @@ export function getRecentMessages(
   botPrefix: string,
 ): NewMessage[] {
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp,
+           COALESCE(mentions_bot, 0) AS mentions_bot
     FROM messages
     WHERE chat_jid = ?
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -598,8 +624,15 @@ export function getRecentMessages(
   `;
   const rows = db
     .prepare(sql)
-    .all(chatJid, `${botPrefix}:%`, limit) as NewMessage[];
-  return rows.reverse(); // Return chronological order (oldest first)
+    .all(chatJid, `${botPrefix}:%`, limit) as Array<
+    NewMessage & { mentions_bot?: number }
+  >;
+  return rows
+    .map((row) => ({
+      ...row,
+      mentions_bot: row.mentions_bot === 1,
+    }))
+    .reverse(); // Return chronological order (oldest first)
 }
 
 export function createTask(

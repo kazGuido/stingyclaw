@@ -17,9 +17,10 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { pipeline, env as xenovaEnv } from '@xenova/transformers';
-import { jsonSchema } from 'ai';
+import { generateText, jsonSchema, type CoreMessage } from 'ai';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
-// Import our custom OpenRouter client (replaces Vercel SDK)
+// Custom OpenRouter client used for Ollama and as fallback
 import { callOpenRouter, convertTools, buildMessages, OpenRouterMessage, OpenRouterTool } from './openrouter-client.js';
 
 // Store model in the shared stingyclaw data dir so it persists across rebuilds
@@ -1357,11 +1358,209 @@ function getIdealMessageCount(prompt: string, currentCount: number): number {
   }
 }
 
+/** Build id -> toolName from prior assistant messages. */
+function toolCallIdToName(messages: ChatMessage[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const m of messages) {
+    if (m.role === 'assistant' && Array.isArray((m as any).tool_calls)) {
+      for (const tc of (m as any).tool_calls) {
+        if (tc.id && tc.function?.name) map[tc.id] = tc.function.name;
+      }
+    }
+  }
+  return map;
+}
+
+/** Convert our ChatMessage[] to AI SDK CoreMessage[] for generateText. */
+function sessionToCoreMessages(messages: ChatMessage[]): CoreMessage[] {
+  const idToName = toolCallIdToName(messages);
+  const out: CoreMessage[] = [];
+  for (const m of messages) {
+    if (m.role === 'system') continue; // system passed separately
+    if (m.role === 'user') {
+      out.push({ role: 'user', content: m.content });
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const msg = m as { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
+      const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : '';
+      const toolCalls = msg.tool_calls ?? [];
+      if (toolCalls.length === 0) {
+        out.push({ role: 'assistant', content: text || '' });
+      } else {
+        const parts: Array<
+          | { type: 'text'; text: string }
+          | { type: 'tool-call'; toolCallId: string; toolName: string; args: unknown }
+        > = [];
+        if (text) parts.push({ type: 'text', text });
+        for (const tc of toolCalls) {
+          let args: unknown;
+          try {
+            args = JSON.parse(tc.function.arguments);
+          } catch {
+            args = { command: tc.function.arguments };
+          }
+          parts.push({ type: 'tool-call', toolCallId: tc.id, toolName: tc.function.name, args });
+        }
+        out.push({ role: 'assistant', content: parts });
+      }
+      continue;
+    }
+    if (m.role === 'tool') {
+      const toolName = idToName[m.tool_call_id] ?? '';
+      out.push({
+        role: 'tool',
+        content: [{ type: 'tool-result', toolCallId: m.tool_call_id, toolName, result: m.content }],
+      });
+      continue;
+    }
+  }
+  return out;
+}
+
+/** Append SDK response messages to session (assistant + tool messages from result.steps). */
+function appendStepsToSession(
+  session: Session,
+  steps: Array<{ text: string; toolCalls: Array<{ toolCallId: string; toolName: string; args: unknown }>; toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }> }>,
+  pendingConfirmationToolCallId: string | null,
+): void {
+  for (const step of steps) {
+    const hasToolCalls = step.toolCalls && step.toolCalls.length > 0;
+    const assistantContent = step.text?.trim() ?? '';
+    const toolCallsForMsg = hasToolCalls
+      ? step.toolCalls.map((tc) => ({
+          id: tc.toolCallId,
+          function: { name: tc.toolName, arguments: typeof tc.args === 'object' && tc.args !== null ? JSON.stringify(tc.args) : String(tc.args) },
+        }))
+      : undefined;
+    session.messages.push({
+      role: 'assistant',
+      content: assistantContent || null,
+      tool_calls: toolCallsForMsg,
+    });
+    if (hasToolCalls && step.toolResults) {
+      for (const tr of step.toolResults) {
+        if (pendingConfirmationToolCallId !== null && tr.toolCallId === pendingConfirmationToolCallId) break; // stop before appending confirmation tool result
+        const content = typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result);
+        const stored =
+          content.length <= MAX_TOOL_RESULT_STORED_CHARS
+            ? content
+            : content.slice(0, MAX_TOOL_RESULT_STORED_CHARS) + '\n[Truncated for context.]';
+        session.messages.push({ role: 'tool', tool_call_id: tr.toolCallId, content: stored });
+      }
+    }
+  }
+}
+
+/** Run the OpenRouter tool loop using Vercel AI SDK (avoids provider 400 on tool-result round-trips). */
+async function runQueryWithSdk(
+  session: Session,
+  input: ContainerInput,
+  modelName: string,
+  baseURL: string,
+  apiKey: string,
+  systemPrompt: string,
+  toolsForContext: VercelToolSet,
+  registry: ToolRegistry,
+): Promise<{
+  result: string | null;
+  closed: boolean;
+  confirmationRequired?: { preview: string; pendingTool: { name: string; args: Record<string, unknown> } };
+}> {
+  if (shouldClose()) {
+    saveSession(session);
+    return { result: null, closed: true };
+  }
+
+  const hasMemory = fs.existsSync(AGENT_MEMORY_PATH);
+  const messagesForApi =
+    hasMemory && session.messages.length > MAX_SESSION_MESSAGES_WITH_MEMORY
+      ? session.messages.slice(-MAX_SESSION_MESSAGES_WITH_MEMORY)
+      : session.messages;
+  const coreMessages = sessionToCoreMessages(messagesForApi);
+
+  const sessionRef: SessionRef = { session };
+  const toolsWithExecute: Record<string, { description: string; parameters: ReturnType<typeof jsonSchema>; execute: (args: Record<string, unknown>, opts: { toolCallId: string }) => Promise<string> }> = {};
+  for (const [name, def] of Object.entries(toolsForContext)) {
+    toolsWithExecute[name] = {
+      ...def,
+      execute: async (args: Record<string, unknown>, opts: { toolCallId: string }) => {
+        const meta = getToolMeta(registry, name);
+        if (meta?.confirmation_required) {
+          session.pendingConfirmation = { toolCallId: opts.toolCallId, name, args };
+          saveSession(session);
+          return buildConfirmationPreview(name, args);
+        }
+        const result = await executeTool(name, args, input, sessionRef);
+        auditLog(input, name, !result.startsWith('Error'), Buffer.byteLength(result, 'utf8'));
+        if (sessionRef.replaceWithNew) {
+          sessionRef.session = newSession();
+          sessionRef.session.messages.push(...session.messages.filter((m) => m.role === 'user').slice(-1));
+          sessionRef.replaceWithNew = false;
+        }
+        return result;
+      },
+    };
+  }
+
+  const openrouter = createOpenRouter({
+    apiKey: apiKey === 'no-key' ? undefined : apiKey,
+    baseURL: baseURL || 'https://openrouter.ai/api/v1',
+    headers: { 'HTTP-Referer': 'https://github.com/kazGuido/stingyclaw', 'X-Title': 'Stingyclaw' },
+  });
+
+  log(`OpenRouter via AI SDK: messages=${coreMessages.length}, tools=${Object.keys(toolsWithExecute).length}, maxSteps=${MAX_TOOL_ITERATIONS}`);
+
+  const result = await generateText({
+    model: openrouter.chat(modelName),
+    system: systemPrompt,
+    messages: coreMessages,
+    tools: toolsWithExecute,
+    maxSteps: MAX_TOOL_ITERATIONS,
+    maxTokens: 8192,
+  });
+
+  const steps = result.steps;
+  const lastText = result.text?.trim() ?? null;
+
+  if (session.pendingConfirmation) {
+    const pending = session.pendingConfirmation;
+    const pendingId = pending.toolCallId;
+    // Append steps up to and including the one that requested confirmation; omit that step's tool result.
+    for (const step of steps) {
+      const hasPending = step.toolCalls?.some((tc: { toolCallId: string }) => tc.toolCallId === pendingId);
+      const assistantContent = step.text?.trim() ?? '';
+      const toolCallsForMsg =
+        step.toolCalls?.map((tc: { toolCallId: string; toolName: string; args: unknown }) => ({
+          id: tc.toolCallId,
+          function: { name: tc.toolName, arguments: typeof tc.args === 'object' && tc.args !== null ? JSON.stringify(tc.args) : String(tc.args) },
+        })) ?? undefined;
+      session.messages.push({ role: 'assistant', content: assistantContent || null, tool_calls: toolCallsForMsg });
+      if (hasPending) break; // do not append tool results for this step
+      if (step.toolResults?.length) {
+        for (const tr of step.toolResults) {
+          const content = typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result);
+          const stored = content.length <= MAX_TOOL_RESULT_STORED_CHARS ? content : content.slice(0, MAX_TOOL_RESULT_STORED_CHARS) + '\n[Truncated for context.]';
+          session.messages.push({ role: 'tool', tool_call_id: tr.toolCallId, content: stored });
+        }
+      }
+    }
+    saveSession(session);
+    const preview = buildConfirmationPreview(pending.name, pending.args);
+    return { result: null, closed: false, confirmationRequired: { preview, pendingTool: { name: pending.name, args: pending.args } } };
+  }
+
+  appendStepsToSession(session, steps, null);
+  saveSession(session);
+  return { result: lastText, closed: false };
+}
+
 async function runQuery(
   prompt: string,
   session: Session,
   input: ContainerInput,
   modelName: string,
+  baseURL: string,
   apiKey: string,
 ): Promise<{
   result: string | null;
@@ -1379,6 +1578,9 @@ async function runQuery(
   }
   // Only document tools we actually pass to the API; avoids "Model tried to call unavailable tool" (e.g. Bash in restricted groups)
   const systemPrompt = buildSystemPrompt(input, Object.keys(toolsForContext));
+  // Convert tool schema once per query so follow-up calls after tool execution
+  // never "drop" the schema (some providers 400 if tool results exist without tools[]).
+  const openRouterToolsAll = toolCount > 0 ? convertTools(toolsForContext) : undefined;
 
   // Clean up old conversation history to prevent context bleed
   // Keep only the last 6 messages if stored memory exists, or last 10 if not
@@ -1418,6 +1620,23 @@ async function runQuery(
   }
 
   let lastText: string | null = null;
+
+  // OpenRouter: use Vercel AI SDK so the provider gets correctly formatted tool round-trips (avoids 400 after tool use).
+  if (apiKey !== 'ollama') {
+    const sdkResult = await runQueryWithSdk(
+      session,
+      input,
+      modelName,
+      baseURL,
+      apiKey,
+      systemPrompt,
+      toolsForContext,
+      registry,
+    );
+    if (sdkResult.closed) return sdkResult;
+    if (sdkResult.confirmationRequired) return sdkResult;
+    return { result: sdkResult.result, closed: false };
+  }
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     if (shouldClose()) {
@@ -1465,19 +1684,25 @@ async function runQuery(
     let toolCalls: Array<{ id: string; function: { name: string; arguments: string } }> = [];
 
     try {
-      // Convert tools to OpenRouter format
-      const openRouterTools = toolsForContext ? convertTools(toolsForContext) : undefined;
-
       // Build messages in OpenRouter format
       const openRouterMessages = buildMessages(systemPrompt, sanitizedMessages);
 
-      // Call OpenRouter directly
-      if (!apiKey || apiKey === 'no-key') {
+      // Always pass tools when available.
+      // Some OpenRouter providers return 400 when a follow-up call contains tool results
+      // but omits the tool schema.
+      const hasToolResults = sanitizedMessages.some(m => m.role === 'tool');
+      const openRouterTools = openRouterToolsAll;
+
+      log(`Calling OpenRouter: messages=${openRouterMessages.length}, tools=${openRouterTools?.length ?? 0}, hasToolResults=${hasToolResults}`);
+
+      // Call OpenRouter directly (Ollama uses apiKey 'ollama' and does not need OPENROUTER_API_KEY)
+      if (apiKey !== 'ollama' && (!apiKey || apiKey === 'no-key')) {
         throw new Error('OPENROUTER_API_KEY not provided');
       }
 
       const result = await callOpenRouter(
         apiKey,
+        baseURL,
         modelName,
         openRouterMessages,
         openRouterTools,
@@ -1502,6 +1727,10 @@ async function runQuery(
       const status = err?.status ?? err?.statusCode;
 
       // Handle specific error types
+      if (msg.includes('429')) {
+        // Preserve upstream status in logs; host layer will retry with backoff.
+        throw err;
+      }
       if (msg.includes('400') && session.messages.length > 6) {
         log(`API 400 with ${session.messages.length} messages — auto-trimming and retrying`);
         session.messages = session.messages.slice(-8);
@@ -1510,8 +1739,62 @@ async function runQuery(
         continue;
       }
 
-      // Re-throw other errors to be handled by outer error handling
-      throw err;
+      // Provider-specific fallback: some models/providers reject role=tool messages on follow-up.
+      // If we already have tool results in history, retry once by converting tool outputs into
+      // plain user text and disabling tools for the retry, so the model can still summarize.
+      const hadToolResults = sanitizedMessages.some((m: any) => m.role === 'tool');
+      if ((status === 400 || msg.includes('400')) && hadToolResults) {
+        log('OpenRouter 400 after tool results — retrying with tool outputs as plain text (no tools)');
+
+        const MAX_FALLBACK_TOOL_OUTPUT = 3500; // Avoid huge HTML/JSON that triggers provider 400
+        const fallbackHistory = sanitizedMessages.map((m: any) => {
+          if (m.role === 'tool') {
+            const toolOut = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            const truncated =
+              toolOut.length <= MAX_FALLBACK_TOOL_OUTPUT
+                ? toolOut
+                : toolOut.slice(0, MAX_FALLBACK_TOOL_OUTPUT) + '\n[Output truncated for length.]';
+            return {
+              role: 'user' as const,
+              content: `[Tool result]\n${truncated}`,
+            };
+          }
+          if (m.role === 'assistant') {
+            // Provider often rejects assistant message with tool_calls when tools=0. Send text only.
+            const text = (m.content && String(m.content).trim()) || 'I called a tool; the result is in the next message.';
+            return { role: 'assistant' as const, content: text };
+          }
+          return m;
+        });
+
+        const fallbackMessages = buildMessages(systemPrompt, fallbackHistory);
+        const retry = await callOpenRouter(
+          apiKey,
+          baseURL,
+          modelName,
+          fallbackMessages,
+          undefined,
+          8192,
+          'none',
+        );
+
+        const choice = retry.choices?.[0];
+        if (!choice) {
+          throw new Error('No response from OpenRouter (fallback)');
+        }
+
+        responseText = choice.message?.content || undefined;
+        toolCalls = (choice.message?.tool_calls || []).map((tc) => ({
+          id: tc.id,
+          function: {
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+          },
+        }));
+      } else {
+        // Re-throw other errors to be handled by outer error handling
+        throw err;
+      }
     }
 
     // Build message structure similar to OpenAI response
@@ -1678,7 +1961,7 @@ async function main(): Promise<void> {
   try {
     while (true) {
       log(`Starting query (session: ${session.id})...`);
-      const runResult = await runQuery(prompt, session, input, modelName, storedApiKey);
+      const runResult = await runQuery(prompt, session, input, modelName, baseURL, storedApiKey);
 
       if (runResult.confirmationRequired) {
         writeOutput({

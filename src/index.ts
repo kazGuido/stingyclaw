@@ -10,6 +10,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  stripLeadingForTriggerMatch,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
@@ -258,7 +259,11 @@ async function handleNewMessagesForGroup(chatJid: string): Promise<void> {
 
   if (needsTrigger) {
     const triggerPattern = buildTriggerPattern(group.trigger);
-    const hasTrigger = allPending.some((m) => triggerPattern.test(m.content.trim()));
+    const hasTrigger = allPending.some(
+      (m) =>
+        triggerPattern.test(stripLeadingForTriggerMatch(m.content)) ||
+        Boolean(m.mentions_bot),
+    );
     if (!hasTrigger) return;
   }
 
@@ -324,8 +329,10 @@ async function processGroupMessages(chatJid: string): Promise<{ ok: boolean; err
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = buildTriggerPattern(group.trigger);
-    const hasTrigger = missedMessages.some((m) =>
-      triggerPattern.test(m.content.trim()),
+    const hasTrigger = missedMessages.some(
+      (m) =>
+        triggerPattern.test(stripLeadingForTriggerMatch(m.content)) ||
+        Boolean(m.mentions_bot),
     );
     if (!hasTrigger) return { ok: true };
   }

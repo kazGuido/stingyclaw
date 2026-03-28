@@ -75,9 +75,14 @@ function escapeRegex(str: string): string {
 }
 
 export const TRIGGER_PATTERN = new RegExp(
-  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  `^\\s*@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
 );
+
+/** Strip leading invisible chars WhatsApp sometimes inserts before text. */
+export function stripLeadingForTriggerMatch(s: string): string {
+  return s.replace(/^[\s\uFEFF\u200E\u200F\u202A-\u202E]+/u, '').trim();
+}
 
 /**
  * Build a trigger regex from a group-specific trigger string (e.g. "@CustomBot").
@@ -86,7 +91,7 @@ export const TRIGGER_PATTERN = new RegExp(
 export function buildTriggerPattern(trigger: string): RegExp {
   const t = trigger.trim();
   if (!t) return TRIGGER_PATTERN; // fallback to global
-  return new RegExp(`^${escapeRegex(t)}\\b`, 'i');
+  return new RegExp(`^\\s*${escapeRegex(t)}\\b`, 'i');
 }
 
 // Timezone for scheduled tasks (cron expressions, etc.)

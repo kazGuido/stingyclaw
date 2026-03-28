@@ -50,6 +50,8 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  /** True when WhatsApp delivered a real @mention of this account (contextInfo.mentionedJid). */
+  mentions_bot?: boolean;
 }
 
 export interface OutboundSendOptions {

@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import makeWASocket, {
+  areJidsSameUser,
   Browsers,
   DisconnectReason,
   WASocket,
@@ -71,6 +72,24 @@ export class WhatsAppChannel implements Channel {
   private reconnectAttempts = 0;
 
   private opts: WhatsAppChannelOpts;
+
+  /**
+   * WhatsApp @mentions set contextInfo.mentionedJid; the visible text often does not start with @Name,
+   * so trigger regex on content alone would never match.
+   */
+  private messageMentionsSelf(msg: {
+    message?: { extendedTextMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null } | null;
+  }): boolean {
+    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid;
+    if (!mentioned?.length) return false;
+    const user = this.sock.user;
+    if (!user?.id) return false;
+    for (const j of mentioned) {
+      if (areJidsSameUser(j, user.id)) return true;
+      if (user.lid && areJidsSameUser(j, user.lid)) return true;
+    }
+    return false;
+  }
 
   constructor(opts: WhatsAppChannelOpts) {
     this.opts = opts;
@@ -250,6 +269,7 @@ export class WhatsAppChannel implements Channel {
               timestamp,
               is_from_me: fromMe,
               is_bot_message: isBotMessage,
+              mentions_bot: false,
             });
             continue;
           }
@@ -273,6 +293,7 @@ export class WhatsAppChannel implements Channel {
           // Any message we sent is a bot message (avoids agent reacting to its own replies).
           // With shared number, also treat assistant-prefixed content as bot.
           const isBotMessage = fromMe || (ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`));
+          const mentionsBot = !fromMe && !isBotMessage && this.messageMentionsSelf(msg);
 
           this.opts.onMessage(chatJid, {
             id: msg.key.id || '',
@@ -283,6 +304,7 @@ export class WhatsAppChannel implements Channel {
             timestamp,
             is_from_me: fromMe,
             is_bot_message: isBotMessage,
+            mentions_bot: mentionsBot,
           });
         }
       }
