@@ -46,6 +46,7 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { flushMessagesForGroup, startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { synthesizeSpeech } from './transcription.js';
+import { startKbDigestLoop } from './kb-digest.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -802,9 +803,13 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  let stopKbDigestLoop: (() => void) | undefined;
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopKbDigestLoop?.();
+    stopKbDigestLoop = undefined;
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -847,6 +852,9 @@ async function main(): Promise<void> {
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
+  });
+  stopKbDigestLoop = startKbDigestLoop({
+    getRegisteredGroups: () => registeredGroups,
   });
   startIpcWatcher({
     sendMessage: (jid, text, options) => {

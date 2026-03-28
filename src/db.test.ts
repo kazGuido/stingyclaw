@@ -2,11 +2,13 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  buildKbDigestSinceCursor,
   createTask,
   deleteTask,
   getMessagePipelineState,
   getAllChats,
   getMessagesSince,
+  getMessagesSinceChronological,
   getNewMessages,
   getRecentMessages,
   getTaskById,
@@ -238,6 +240,50 @@ describe('getMessagesSince', () => {
     });
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:04.000Z', 'Andy');
     expect(msgs).toHaveLength(0);
+  });
+});
+
+// --- buildKbDigestSinceCursor ---
+
+describe('buildKbDigestSinceCursor', () => {
+  const cut = '2024-06-01T12:00:00.000Z';
+
+  it('uses lookback when cursor is missing', () => {
+    expect(buildKbDigestSinceCursor(undefined, cut)).toBe(cut);
+    expect(buildKbDigestSinceCursor('', cut)).toBe(cut);
+  });
+
+  it('uses lookback when stored cursor is older than lookback', () => {
+    expect(buildKbDigestSinceCursor('2024-01-01T00:00:00.000Z', cut)).toBe(cut);
+  });
+
+  it('keeps full JSON cursor when its timestamp is at or after lookback', () => {
+    const cur = JSON.stringify({
+      timestamp: '2024-06-02T00:00:00.000Z',
+      messageId: 'm1',
+    });
+    expect(buildKbDigestSinceCursor(cur, cut)).toBe(cur);
+  });
+});
+
+// --- getMessagesSinceChronological ---
+
+describe('getMessagesSinceChronological', () => {
+  it('returns oldest matching messages first, capped by limit', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    for (let i = 1; i <= 5; i++) {
+      store({
+        id: `m${i}`,
+        chat_jid: 'group@g.us',
+        sender: 'a@s.whatsapp.net',
+        sender_name: 'Alice',
+        content: `msg${i}`,
+        timestamp: `2024-01-01T00:00:0${i}.000Z`,
+      });
+    }
+    const msgs = getMessagesSinceChronological('group@g.us', '2024-01-01T00:00:00.000Z', 'Andy', 3);
+    expect(msgs).toHaveLength(3);
+    expect(msgs.map((m) => m.content)).toEqual(['msg1', 'msg2', 'msg3']);
   });
 });
 

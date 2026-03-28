@@ -50,6 +50,28 @@ function messageCursorFilter(cursor: MessageCursor): { where: string; params: st
   };
 }
 
+/**
+ * Lower bound for KB digest message fetch: at least `lookbackCutIso` (e.g. now − 12h),
+ * but if we already processed past that, keep the full stored cursor for id tie-breaks.
+ */
+export function buildKbDigestSinceCursor(
+  storedCursor: string | undefined,
+  lookbackCutIso: string,
+): string {
+  if (!storedCursor || !storedCursor.trim()) {
+    return lookbackCutIso;
+  }
+  const parsed = parseMessageCursor(storedCursor);
+  const ts = parsed.timestamp;
+  if (!ts) {
+    return lookbackCutIso;
+  }
+  if (ts < lookbackCutIso) {
+    return lookbackCutIso;
+  }
+  return storedCursor;
+}
+
 export type MessagePipelineState =
   | 'received'
   | 'queued'
@@ -603,6 +625,39 @@ export function getMessagesSince(
       ORDER BY timestamp DESC
       LIMIT ?
     ) ORDER BY timestamp
+  `;
+  const rows = db
+    .prepare(sql)
+    .all(chatJid, ...messageFilter.params, `${botPrefix}:%`, limit) as Array<
+    NewMessage & { mentions_bot?: number }
+  >;
+  return rows.map((row) => ({
+    ...row,
+    mentions_bot: row.mentions_bot === 1,
+  }));
+}
+
+/**
+ * Like {@link getMessagesSince}, but returns the oldest `limit` matching messages first
+ * (chronological). Use for KB digest so we do not skip older traffic when the window is busy.
+ */
+export function getMessagesSinceChronological(
+  chatJid: string,
+  sinceTimestamp: string,
+  botPrefix: string,
+  limit: number = DEFAULT_MESSAGE_CATCHUP_LIMIT,
+): NewMessage[] {
+  const cursor = parseMessageCursor(sinceTimestamp);
+  const messageFilter = messageCursorFilter(cursor);
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp,
+           COALESCE(mentions_bot, 0) AS mentions_bot
+    FROM messages
+    WHERE chat_jid = ? AND ${messageFilter.where}
+      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL
+    ORDER BY timestamp ASC
+    LIMIT ?
   `;
   const rows = db
     .prepare(sql)
